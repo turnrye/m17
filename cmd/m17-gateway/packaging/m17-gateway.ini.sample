@@ -44,6 +44,10 @@ Callsign=
 Passcode=-1
 ; Gate packets heard on RF to APRS-IS.
 RFtoIS=true
+; Added, used, to the path of packets gated from RF, before the q construct,
+; to show they came over M17, as D-Star gateways add DSTAR*:
+;   K0RET-7>APORT1,M17*,qAR,N0CALL-10:...   Leave empty for none.
+PathTag=M17
 ; Transmit messages from APRS-IS to stations heard on RF in the last
 ; HeardWindow. Every one is airtime nobody can talk in.
 IStoRF=false

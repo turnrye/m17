@@ -59,9 +59,23 @@ func TestRFToIS(t *testing.T) {
 		{"N0GW>APDW17:}W1AW>APK004,TCPIP*:}X>Y:>z", "", dropNoGate},
 		{"N0GW>APDW17:}garbage", "", dropMalformed},
 	} {
-		got, reason := rfToIS(mustTNC2(t, c.line), "K0RET-10", "qAR")
+		got, reason := rfToIS(mustTNC2(t, c.line), "K0RET-10", "qAR", "")
 		if got != c.want || reason != c.reason {
 			t.Errorf("rfToIS(%q) = %q, %q; want %q, %q", c.line, got, reason, c.want, c.reason)
+		}
+	}
+}
+
+// TestRFToISTag: the path tag goes before the q construct, used, once.
+func TestRFToISTag(t *testing.T) {
+	for line, want := range map[string]string{
+		"K0RET-7>APORT1:>here":            "K0RET-7>APORT1,M17*,qAR,K0RET-10:>here",
+		"K0RET-7>APORT1,WIDE1-1*:>here":   "K0RET-7>APORT1,WIDE1-1*,M17*,qAR,K0RET-10:>here",
+		"K0RET-7>APORT1,M17*:>here":       "K0RET-7>APORT1,M17*,qAR,K0RET-10:>here",
+		"N0GW>APDW17:}W1AW>APK004:>inner": "W1AW>APK004,M17*,qAR,K0RET-10:>inner",
+	} {
+		if got, reason := rfToIS(mustTNC2(t, line), "K0RET-10", "qAR", "M17"); got != want || reason != "" {
+			t.Errorf("rfToIS(%q) = %q, %q; want %q", line, got, reason, want)
 		}
 	}
 }

@@ -161,6 +161,12 @@ The CC1200 driver keys about 12 ms before the packet and holds TX 80 ms after it
 
 The q construct is `qAR` when `IStoRF` is on and `qAO` (receive-only gate) when it is off, as in Dire Wolf.
 
+**Path tag:** before the q construct, the gate adds `M17*` (`PathTag`) to show the packet came over M17, as D-Star gateways add `DSTAR*`. ircDDBGateway writes `CALL>APDPRS,DSTAR*:…`. aprs.fi then shows `via M17*,qAR,<gate>`.
+- The `*` marks it as used, so nothing digipeats it.
+- Duplicate checks ignore the path, so two gates hearing one packet still collapse it.
+- It isn't added twice, so a radio could put `M17*` in its own path.
+- The alternatives don't fit. A new q construct isn't allowed, since the set is fixed by the APRS-IS q algorithm. A separate TOCALL would mislabel the device, since the TOCALL names the software, not the transport.
+
 **APRS-IS → RF.** A message, ack or rej goes if all of these hold:
 
 - its addressee was heard on RF within `HeardWindow` (not via another gate or a relay);

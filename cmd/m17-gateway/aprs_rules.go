@@ -211,8 +211,10 @@ var noGateRF = []string{"TCPXX", "NOGATE", "RFONLY", "qAX"}
 // rfToIS decides whether a line heard on RF goes to APRS-IS and returns
 // it as sent there, with the q construct and gate callsign appended. A
 // third-party packet is unwrapped, layer by layer, and its inner packet
-// gated instead.
-func rfToIS(t tnc2, gate, qConstruct string) (string, string) {
+// gated instead. A tag such as "M17" goes in the path, used, before the q
+// construct, to show how the packet reached the gate, as D-Star gateways
+// add "DSTAR*"; it isn't added twice.
+func rfToIS(t tnc2, gate, qConstruct, tag string) (string, string) {
 	for {
 		if sameStation(t.src, gate) {
 			return "", dropOwn
@@ -233,7 +235,11 @@ func rfToIS(t tnc2, gate, qConstruct string) (string, string) {
 		t = inner
 	}
 	out := t
-	out.path = append(append([]string(nil), t.path...), qConstruct, gate)
+	out.path = append([]string(nil), t.path...)
+	if tag != "" && !t.hasPathElement(tag) {
+		out.path = append(out.path, tag+"*")
+	}
+	out.path = append(out.path, qConstruct, gate)
 	return out.String(), ""
 }
 

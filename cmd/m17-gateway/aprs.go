@@ -76,6 +76,7 @@ type aprsConfig struct {
 	haat           float64 // antenna height above average terrain, m
 	gain           float64 // antenna gain, dBi
 	ambiguity      int     // beacon position ambiguity, 0 to 4
+	pathTag        string  // added to the path of packets gated from RF
 	logPath        string
 	statusPath     string
 	watches        []watchRule
@@ -106,6 +107,7 @@ func loadAPRSConfig(s *ini.Section) (aprsConfig, error) {
 		haat:           s.Key("HAAT").MustFloat64(0),
 		gain:           s.Key("Gain").MustFloat64(0),
 		ambiguity:      s.Key("Ambiguity").MustInt(0),
+		pathTag:        strings.ToUpper(strings.TrimSpace(s.Key("PathTag").MustString("M17"))),
 		logPath:        strings.TrimSpace(s.Key("Log").String()),
 		statusPath:     strings.TrimSpace(s.Key("Status").String()),
 	}
@@ -132,6 +134,9 @@ func loadAPRSConfig(s *ini.Section) (aprsConfig, error) {
 	}
 	if c.can < 0 || c.can > 15 || c.ambiguity < 0 || c.ambiguity > 4 || c.haat < 0 || c.gain < 0 {
 		errs = append(errs, fmt.Errorf("APRS CAN must be 0 to 15, Ambiguity 0 to 4, and HAAT and Gain not negative"))
+	}
+	if c.pathTag != "" && !isAX25Call(c.pathTag) {
+		errs = append(errs, fmt.Errorf("APRS PathTag %q must look like a callsign, such as M17", c.pathTag))
 	}
 	if len(c.symbol) != 2 {
 		errs = append(errs, fmt.Errorf("APRS Symbol must be a table and a code, such as M&"))
@@ -358,7 +363,7 @@ func (a *igate) fromRF(lsf *m17.LSF, payload []byte) {
 		a.log.write(now, aprsEvent{Dir: aprsFromRF, M17: m17Src, Line: line, Result: "heard (RFtoIS off)"})
 		return
 	}
-	out, reason := rfToIS(t, a.cfg.callsign, a.qConstruct())
+	out, reason := rfToIS(t, a.cfg.callsign, a.qConstruct(), a.cfg.pathTag)
 	if reason == "" {
 		k, _ := parseTNC2(out)
 		if now.Sub(a.toIS[k.key()]) < rfDupeWindow {
