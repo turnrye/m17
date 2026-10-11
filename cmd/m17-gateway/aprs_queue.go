@@ -68,6 +68,27 @@ func newGatedQueue(maxAge time.Duration, perMinute, burst int, now time.Time) *g
 	}
 }
 
+// setParams changes the queue's age limit and rate while it runs.
+func (q *gatedQueue) setParams(maxAge time.Duration, perMinute, burst int) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	q.maxAge = maxAge
+	q.rate = float64(perMinute) / 60
+	q.burst = float64(burst)
+	q.tokens = min(q.tokens, q.burst)
+}
+
+// counts reports how many packets each class holds.
+func (q *gatedQueue) counts() map[string]int {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	n := map[string]int{}
+	for i, c := range q.classes {
+		n[gatedClass(i).String()] = len(c)
+	}
+	return n
+}
+
 // push queues p, replacing a queued packet with the same key.
 func (q *gatedQueue) push(p *gatedPacket) {
 	q.mu.Lock()

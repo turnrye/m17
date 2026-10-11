@@ -141,7 +141,7 @@ func testGated(t *testing.T, g *Gateway, gap time.Duration) *gatedQueue {
 	t.Helper()
 	q := newGatedQueue(time.Minute, 6000, 100, time.Now())
 	stop := make(chan struct{})
-	go g.sendGated(q, gap, stop)
+	go g.sendGated(q, func() time.Duration { return gap }, stop)
 	t.Cleanup(func() { close(stop) })
 	return q
 }

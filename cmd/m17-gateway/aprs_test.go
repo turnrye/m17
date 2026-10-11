@@ -334,18 +334,80 @@ func TestCourtesyPosition(t *testing.T) {
 	}
 }
 
-// TestExtraFilter: what the operator's filter brings goes to RF, except
-// from stations heard on RF.
-func TestExtraFilter(t *testing.T) {
+// watching sets a's rules from Watch values.
+func watching(t *testing.T, a *igate, values ...string) {
+	t.Helper()
+	a.cfg.watches = nil
+	for i, v := range values {
+		w, err := parseWatch("Watch"+strconv.Itoa(i+1), v)
+		if err != nil {
+			t.Fatal(err)
+		}
+		a.cfg.watches = append(a.cfg.watches, w)
+	}
+	a.updateFilterLocked()
+}
+
+// TestRawFilterWatched: what only the raw Filter brings is logged, not
+// transmitted.
+func TestRawFilterWatched(t *testing.T) {
 	now := time.Now()
 	a := testIgate(t, &now)
 	a.cfg.filter = "m/10"
 	a.fromIS("W1AW>APK004,TCPIP*,qAC,T2TEST:>status")
-	hearRF(t, a, "K0RET", 0, "K0RET-7>APORT1:>here")
-	a.fromIS("K0RET-7>APORT1,qAR,N0GW:>status")
+	if a.queue.len() != 0 || a.counts["isWatched"] != 1 {
+		t.Errorf("queued %d, watched %d", a.queue.len(), a.counts["isWatched"])
+	}
+}
+
+// TestWatchArea: an rf area rule transmits positions inside its radius,
+// and later packets from those stations, but not local stations' or ones
+// outside it.
+func TestWatchArea(t *testing.T) {
+	now := time.Now()
+	a := testIgate(t, &now)
+	watching(t, a, "area 41.7 -72.7 20 rf")
+	if !strings.Contains(a.filter, "r/41.7000/-72.7000/20") {
+		t.Errorf("filter %q", a.filter)
+	}
+	a.fromIS("W1AW>APK004,TCPIP*,qAC,T2TEST:!4142.35N/07243.81W-")  // inside
+	a.fromIS("W1AW>APK004,TCPIP*,qAC,T2TEST:>status")               // its last position is inside
+	a.fromIS("N1ADJ>APK004,TCPIP*,qAC,T2TEST:!4352.73N/06959.22W-") // outside
+	hearRF(t, a, "K0RET", 0, "K0RET-7>APORT1:!4142.00N/07243.00W[")
+	a.fromIS("K0RET-7>APORT1,qAR,N0GW:!4142.00N/07243.00W[x")
 	q := queuedRF(a, now)
-	if len(q) != 1 || q[0].class != gatedOther || q[0].from != "W1AW" {
+	if len(q) != 2 || q[0].from != "W1AW" || q[1].from != "W1AW" {
 		t.Errorf("queued %v", q)
+	}
+}
+
+// TestWatchCall: a call rule selects traffic from a station and messages
+// to it; dashboard rules only log it; rules end on time.
+func TestWatchCall(t *testing.T) {
+	now := time.Now()
+	a := testIgate(t, &now)
+	until := now.Add(time.Hour).UTC().Format(time.RFC3339)
+	watching(t, a, "call W1AW rf until "+until, "call N1ADJ* dashboard")
+	if !strings.Contains(a.filter, "b/W1AW g/W1AW") || !strings.Contains(a.filter, "b/N1ADJ* g/N1ADJ*") {
+		t.Errorf("filter %q", a.filter)
+	}
+	a.fromIS("W1AW>APK004,TCPIP*,qAC,T2TEST:>status")
+	a.fromIS("KK4IOH-1>APIN22,TCPIP*,qAC,T2TEST::W1AW     :hi{1")
+	a.fromIS("N1ADJ-7>APK004,TCPIP*,qAC,T2TEST:>status")
+	if q := queuedRF(a, now); len(q) != 2 || q[1].class != gatedOther {
+		t.Errorf("queued %v", q)
+	}
+	if a.counts["isWatched"] != 1 {
+		t.Errorf("watched %d, want 1", a.counts["isWatched"])
+	}
+	now = now.Add(2 * time.Hour)
+	a.expire(now)
+	if strings.Contains(a.filter, "W1AW ") {
+		t.Errorf("ended rule still in filter %q", a.filter)
+	}
+	a.fromIS("W1AW>APK004,TCPIP*,qAC,T2TEST:>later")
+	if a.queue.len() != 0 {
+		t.Error("ended rule still transmits")
 	}
 }
 
@@ -359,7 +421,7 @@ func TestGatewayAPRS(t *testing.T) {
 	a.m17Call = g.callsign
 	g.aprs = a
 	stop := make(chan struct{})
-	go g.sendGated(a.queue, 50*time.Millisecond, stop)
+	go g.sendGated(a.queue, func() time.Duration { return 50 * time.Millisecond }, stop)
 	t.Cleanup(func() { close(stop) })
 
 	p, err := m17.NewPacket(m17.DestinationAll, "K0RET", m17.PacketTypeAPRS, []byte("K0RET-7>APORT1:!3508.37N/09001.05W[\x00"))

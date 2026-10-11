@@ -7,7 +7,7 @@
 A hotspot gates APRS carried in M17 packet mode between its RF and APRS-IS, the way an RF iGate does for AX.25:
 
 - **RF → APRS-IS.** A `0x02` packet heard on RF is sent to APRS-IS with `,qAR,<gate>` appended. Packets are still forwarded to the reflector as before.
-- **APRS-IS → RF.** Messages for stations heard on this hotspot's RF, plus anything an optional extra filter selects, are transmitted as `0x02` packets. They go out broadcast, under the gateway's M17 callsign, through the existing packet queue.
+- **APRS-IS → RF.** Messages for stations heard on this hotspot's RF, plus whatever the operator's `rf` watch rules select, are transmitted as `0x02` packets. They go out broadcast, under the gateway's M17 callsign, through the existing packet queue.
 
 - **Relay (optional, simplex only).** Messages and acks between two stations both heard on RF are relayed when they evidently can't hear each other.
 
@@ -88,7 +88,7 @@ Ryan's rule: an APRS-IS packet is not transmitted if the same packet (source, de
 Dire Wolf goes less far. It never compares APRS-IS packets with what it hears. It only suppresses packets its own digipeater or IGate sent in the last 60 s, and messages whose sender was heard directly in the last minute (its `i/` filter). The gate does both of those as well:
 
 - **Local sender:** a message whose sender was heard on RF within 1 minute stays off RF, since the addressee can hear the sender.
-- **Extra-filter traffic** stays off RF when its source was heard on RF within `HeardWindow`.
+- **Watched traffic** (the operator's `rf` rules) stays off RF when its source was heard on RF within `HeardWindow`.
 
 **Local stations on a simplex hotspot** that can't hear each other would otherwise never get each other's messages. Gating doesn't help: APRS-IS doesn't return a packet to the client that sent it, and the local-sender rule would stop it anyway. On FM a digipeater covers this, so the gate has a narrow relay for it (`Relay`, off by default; decision 7).
 
@@ -149,9 +149,45 @@ The q construct is `qAR` when `IStoRF` is on and `qAO` (receive-only gate) when 
 Two more kinds go:
 
 - **Courtesy position:** after a message, the sender's position goes once per 30 minutes. It is the last position seen if there is one. Otherwise the filter asks for the sender's next position (`b/`), and that one goes.
-- **Extra-filter traffic:** anything the extra `Filter` brings, unless its source is local. Messages from it still need their addressee to have been heard.
+- **Watched traffic:** whatever the operator's `rf` watch rules select, unless its source is local (see Operator rules).
 
-The server filter is `g/<gate>/<heard stations…>`, plus `b/<senders owed a position>`, plus `Filter`. It is updated with `#filter` as stations come and go.
+The server filter is `g/<gate>/<heard stations…>`, plus `b/<senders owed a position>`, plus the watch rules in force, plus the raw `Filter`. It is updated with `#filter` as stations come and go, and as rules start and end.
+
+## Operator rules
+
+Beyond the iGate's own selection, the operator chooses more APRS-IS traffic with up to 16 rules, `Watch1` to `Watch16` in `[APRS]`. Each one asks the server for some traffic and says what to do with it:
+
+| Rule | Server filter | Matches |
+|---|---|---|
+| `call CALL` (`CALL*` for every SSID) | `b/CALL g/CALL` | packets from the station, and messages to it |
+| `area LAT LON KM` | `r/LAT/LON/KM` | packets placed within KM of the point, and others from stations last placed there |
+| `near KM` | `r/` around `Latitude`/`Longitude` | the same, around the gate; nothing without a position |
+
+**Actions:**
+- `rf` transmits what the rule selects, with the same quiet gap, rate limit and queue as other APRS-IS traffic, but never a local station's own packets.
+- `dashboard` (the default) only logs it, so a wide area can be watched without spending airtime.
+- An optional `until <RFC 3339 time>` ends the rule, and the filter drops it. That suits "follow this station for two hours".
+
+**Matching:** the server can't say which part of a filter selected a packet, so the gate checks each one against the rules itself. A rule that transmits wins over one that only logs. For a packet with no position, the sender's last known position counts.
+
+**The raw `Filter`:** for anything the rules can't express. What only it selects is logged, never transmitted.
+
+## Live configuration and status
+
+The gate re-reads `[APRS]` when the configuration file changes, so a dashboard only needs to save the file.
+
+- **When it applies:** a change is applied once the file has been unchanged for one 5-second poll, so a half-written file isn't read. A section that doesn't load is reported and left unapplied.
+- **What takes effect at once:** toggles, rules, filter, rates and beacon settings. A new server, callsign or passcode logs in again. The reflector link and the heard list are untouched.
+- **Turning APRS on** needs a restart, since the gate isn't created at all while it is off.
+
+With `Status` set, the gate rewrites a JSON status file every 5 seconds. It holds:
+- whether it is logged in, and to which server (taken from the server's own keepalive lines);
+- verified or receive only;
+- the filter in force;
+- the heard stations, with their M17 callsign and CAN;
+- the rules and whether each is active;
+- the queue by class;
+- counters, and the last beacon.
 
 ## Channel sharing
 

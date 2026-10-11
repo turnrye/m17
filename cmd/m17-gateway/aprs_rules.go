@@ -171,6 +171,7 @@ const (
 	dropOnAir       = "already heard on RF"
 	dropDuplicate   = "duplicate"
 	dropUnverified  = "receive-only login"
+	dropWatched     = "watched"
 )
 
 // noGateIS lists path elements that keep a packet off APRS-IS.

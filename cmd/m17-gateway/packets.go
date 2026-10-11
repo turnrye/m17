@@ -130,7 +130,7 @@ func (g *Gateway) packetSent() {
 // it. A burst of gated packets therefore leaves a gap after each one.
 
 // sendGated passes gated packets to the packet sender until stop closes.
-func (g *Gateway) sendGated(q *gatedQueue, minTxGap time.Duration, stop <-chan struct{}) {
+func (g *Gateway) sendGated(q *gatedQueue, minTxGap func() time.Duration, stop <-chan struct{}) {
 	for {
 		if q.len() == 0 {
 			select {
@@ -140,7 +140,8 @@ func (g *Gateway) sendGated(q *gatedQueue, minTxGap time.Duration, stop <-chan s
 			}
 			continue
 		}
-		wait := g.gatedWait(time.Now(), minTxGap)
+		gap := minTxGap()
+		wait := g.gatedWait(time.Now(), gap)
 		if wait <= 0 && len(g.packetQueue) > 0 {
 			wait = channelPoll
 		}
@@ -148,7 +149,7 @@ func (g *Gateway) sendGated(q *gatedQueue, minTxGap time.Duration, stop <-chan s
 			var p *gatedPacket
 			p, wait = q.next(time.Now())
 			if p != nil {
-				g.transmitGated(p, minTxGap)
+				g.transmitGated(p, gap)
 				continue
 			}
 			if wait <= 0 {
@@ -187,6 +188,7 @@ func (g *Gateway) transmitGated(p *gatedPacket, gap time.Duration) {
 			if err != nil {
 				result = "error: " + err.Error()
 			}
+			g.aprs.count("rfSent")
 			g.aprs.log.write(time.Now(), aprsEvent{Dir: aprsToRF, Line: p.line, Result: result, Class: p.class.String()})
 		}
 		return err

@@ -54,6 +54,7 @@ type config struct {
 	overrideHostfile *inet.Hostfile
 	audioDir         string
 	aprs             aprsConfig
+	path             string // the configuration file
 }
 
 func loadConfig(iniFile string, inFile string, outFile string) (config, error) {
@@ -218,6 +219,7 @@ func loadConfig(iniFile string, inFile string, outFile string) (config, error) {
 		overrideHostfile: reflectorOverrideHostfile,
 		audioDir:         audioDir,
 		aprs:             aprsCfg,
+		path:             iniFile,
 	}, err
 }
 
@@ -402,16 +404,16 @@ func NewGateway(cfg config, modem modem.Modem) (*Gateway, error) {
 			cfg.aprs.relay = false
 		}
 		g.aprs = newIgate(cfg.aprs, cfg.callsign)
+		g.aprs.duplex = cfg.duplex
 		if cfg.aprs.logPath != "" {
 			g.aprs.log, err = openAPRSLog(cfg.aprs.logPath)
 			if err != nil {
 				return nil, fmt.Errorf("opening APRS Log: %w", err)
 			}
 		}
-		if g.aprs.queue != nil {
-			go g.sendGated(g.aprs.queue, cfg.aprs.minTxGap, g.aprs.done)
-		}
+		go g.sendGated(g.aprs.queue, g.aprs.minTxGap, g.aprs.done)
 		g.aprs.start()
+		go g.aprs.watchConfig(cfg.path)
 	}
 	err = g.loadAudioClips(cfg.audioDir, cfg.callsign)
 	if err != nil {

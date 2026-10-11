@@ -32,6 +32,8 @@ Module=C
 [APRS]
 ; Gate APRS packets carried in M17 packet mode (type 0x02, a TNC2 line) between
 ; RF and APRS-IS, as an iGate does. See docs/aprs-igate.md.
+; Changes to this section are applied while the gateway runs, within about
+; 10 seconds, except Enabled, which needs a restart to turn on.
 Enabled=false
 Server=rotate.aprs2.net:14580
 ; The gate's own APRS callsign, an AX.25 one such as N0CALL-10. Radios take
@@ -45,8 +47,17 @@ RFtoIS=true
 ; Transmit messages from APRS-IS to stations heard on RF in the last
 ; HeardWindow. Every one is airtime nobody can talk in.
 IStoRF=false
-; An extra APRS-IS server filter. Everything it selects is transmitted too,
-; except from stations heard on RF. Leave empty for messages only.
+; Traffic to watch, beyond messages for stations heard on RF: up to 16 rules,
+; Watch1 to Watch16, each
+;   call CALL[*]        from that station, or messages to it ('*': any SSID)
+;   area LAT LON KM     within KM of a point
+;   near KM             within KM of Latitude/Longitude below
+; then "rf" to transmit what it brings (except local stations' own), or
+; "dashboard" to only log it, and optionally "until" an RFC 3339 time.
+; Watch1=call K0RET-4 rf until 2026-10-11T19:00:00Z
+; Watch2=near 30 dashboard
+; A raw APRS-IS server filter, for anything the rules can't say. What only it
+; selects is logged, never transmitted.
 Filter=
 HeardWindow=60m
 ; A packet from APRS-IS waits for a quiet channel at most this long; senders
@@ -65,6 +76,9 @@ CourtesyPosition=true
 ; and what was sent, as JSON lines for the dashboard's APRS page. Rotated at
 ; 4 MB. Leave empty for none.
 Log=/opt/m17/m17-gateway/aprs.log
+; How the gate is doing, as JSON rewritten every 5 seconds for the dashboard:
+; the APRS-IS server, login, filter, heard stations, rules, queue, counters.
+Status=/opt/m17/m17-gateway/aprs-status.json
 ; Simplex only: relay APRS messages between two stations both heard on RF,
 ; which may not hear each other. A message waits RelayHold, and isn't relayed
 ; if its addressee acks it first; an ack is relayed only for a message that

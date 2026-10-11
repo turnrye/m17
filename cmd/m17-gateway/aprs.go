@@ -31,6 +31,7 @@ const (
 	aprsReconnectMin = 10 * time.Second
 	aprsReconnectMax = 5 * time.Minute
 	aprsTick         = time.Minute
+	aprsStatusEvery  = 5 * time.Second
 
 	// rfDupeWindow suppresses a packet heard on RF again, as APRS-IS does.
 	rfDupeWindow = 30 * time.Second
@@ -72,6 +73,8 @@ type aprsConfig struct {
 	symbol         string
 	comment        string
 	logPath        string
+	statusPath     string
+	watches        []watchRule
 }
 
 func loadAPRSConfig(s *ini.Section) (aprsConfig, error) {
@@ -96,6 +99,12 @@ func loadAPRSConfig(s *ini.Section) (aprsConfig, error) {
 		symbol:         s.Key("Symbol").MustString("I&"),
 		comment:        s.Key("Comment").String(),
 		logPath:        strings.TrimSpace(s.Key("Log").String()),
+		statusPath:     strings.TrimSpace(s.Key("Status").String()),
+	}
+	var watchErrs []error
+	c.watches, watchErrs = loadWatches(s)
+	for _, err := range watchErrs {
+		log.Printf("[ERROR] APRS: ignoring %v", err)
 	}
 	if !c.enabled {
 		return c, nil
@@ -137,9 +146,11 @@ type igate struct {
 	verified bool // the passcode matches, so APRS-IS takes what is sent
 	m17Call  string
 	m17Enc   *m17.EncodedCallsign
-	queue    *gatedQueue // nil unless IS to RF or the relay is on
-	log      *aprsLog    // nil unless Log is set
+	duplex   bool // no relay: a duplex gateway repeats every packet already
+	queue    *gatedQueue
+	log      *aprsLog // nil unless Log is set
 	now      func() time.Time
+	reconf   chan struct{}
 
 	mu           sync.Mutex
 	heard        map[string]*heardStation // by APRS callsign
@@ -151,7 +162,15 @@ type igate struct {
 	courtesySent map[string]time.Time
 	courtesyLSF  map[string][2]byte
 	relayed      map[string]time.Time // messages relayed, as "SRC>DST{id"
+	lastPosition map[string]posAt     // latest APRS-IS position by source
 	filter       string               // the server filter last asked for
+	counts       map[string]int       // traffic counters, for the status file
+	server       string               // the APRS-IS server, from its keepalives
+	serverLine   string               // its last keepalive
+	serverSeen   time.Time
+	connectedAt  time.Time
+	lastBeacon   time.Time
+	beaconLine   string
 	conn         *fap.Conn
 	out          chan string
 	done         chan struct{}
@@ -173,18 +192,77 @@ func newIgate(cfg aprsConfig, m17Call string) *igate {
 		courtesySent: map[string]time.Time{},
 		courtesyLSF:  map[string][2]byte{},
 		relayed:      map[string]time.Time{},
+		lastPosition: map[string]posAt{},
+		counts:       map[string]int{},
 		out:          make(chan string, 64),
 		done:         make(chan struct{}),
+		reconf:       make(chan struct{}, 1),
 	}
 	a.m17Enc, _ = m17.EncodeCallsign(m17Call)
-	if cfg.isToRF || cfg.relay {
-		a.queue = newGatedQueue(cfg.maxQueueAge, cfg.rateLimit, cfg.rateBurst, time.Now())
-		a.queue.dropped = func(p *gatedPacket, why string) {
-			a.log.write(a.now(), aprsEvent{Dir: aprsToRF, Line: p.line, Result: why, Class: p.class.String()})
-		}
+	// Always there, so that IStoRF or Relay can be turned on while running.
+	a.queue = newGatedQueue(cfg.maxQueueAge, cfg.rateLimit, cfg.rateBurst, time.Now())
+	a.queue.dropped = func(p *gatedPacket, why string) {
+		a.counts["rfDropped"]++
+		a.log.write(a.now(), aprsEvent{Dir: aprsToRF, Line: p.line, Result: why, Class: p.class.String()})
 	}
 	a.filter = a.buildFilter()
 	return a
+}
+
+// posAt is a station's position and when it was seen.
+type posAt struct {
+	p  [2]float64
+	at time.Time
+}
+
+// passcodeOK reports whether c's passcode is its callsign's, so that
+// APRS-IS takes what the gate sends.
+func passcodeOK(c aprsConfig) bool {
+	return c.passcode == strconv.Itoa(int(fap.AprsPasscode(c.callsign)))
+}
+
+// reconfigure applies a new [APRS] section while the gateway runs. A new
+// server, callsign or passcode means logging in again; everything else
+// takes effect at once.
+func (a *igate) reconfigure(c aprsConfig) {
+	if c.relay && a.duplex {
+		c.relay = false
+	}
+	if !c.enabled {
+		c.rfToIS, c.isToRF, c.relay = false, false, false
+	}
+	a.mu.Lock()
+	old := a.cfg
+	a.cfg = c
+	a.verified = passcodeOK(c)
+	a.queue.setParams(c.maxQueueAge, c.rateLimit, c.rateBurst)
+	a.updateFilterLocked()
+	conn := a.conn
+	a.mu.Unlock()
+	relogin := old.enabled != c.enabled || old.server != c.server ||
+		old.callsign != c.callsign || old.passcode != c.passcode
+	log.Printf("[INFO] APRS: configuration changed%s", map[bool]string{true: "; logging in again", false: ""}[relogin])
+	if relogin && conn != nil {
+		conn.Close() // run() logs in again with the new settings
+	}
+	select {
+	case a.reconf <- struct{}{}:
+	default:
+	}
+}
+
+// minTxGap returns the gap before a packet from APRS-IS.
+func (a *igate) minTxGap() time.Duration {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.cfg.minTxGap
+}
+
+// count adds one to a traffic counter.
+func (a *igate) count(name string) {
+	a.mu.Lock()
+	a.counts[name]++
+	a.mu.Unlock()
 }
 
 // start connects to APRS-IS and keeps the gate's state current.
@@ -208,7 +286,7 @@ func (a *igate) close() {
 
 // qConstruct is qAR for a gate that also transmits, qAO for receive only.
 func (a *igate) qConstruct() string {
-	if a.cfg.isToRF {
+	if a.cfg.isToRF || a.cfg.relay {
 		return "qAR"
 	}
 	return "qAO"
@@ -227,6 +305,7 @@ func (a *igate) fromRF(lsf *m17.LSF, payload []byte) {
 		return
 	}
 	a.mu.Lock()
+	a.counts["rfHeard"]++
 	// A packet another gate brought from APRS-IS, or a gateway relayed
 	// (marked by Extended Callsign Data), is on the air, but its source is
 	// not a station heard here.
@@ -260,13 +339,20 @@ func (a *igate) fromRF(lsf *m17.LSF, payload []byte) {
 			a.toIS[k.key()] = now
 		}
 	}
+	verified := a.verified
+	switch {
+	case reason != "":
+		a.counts["rfNotGated"]++
+	case verified:
+		a.counts["rfGated"]++
+	}
 	a.mu.Unlock()
 	ev := aprsEvent{Dir: aprsFromRF, M17: m17Src, Line: line, Out: out}
 	switch {
 	case reason != "":
 		log.Printf("[DEBUG] APRS: not gating to APRS-IS (%s): %s", reason, line)
 		ev.Result = "not gated: " + reason
-	case !a.verified:
+	case !verified:
 		log.Printf("[INFO] APRS: would gate to APRS-IS (receive-only login): %s", out)
 		ev.Result = "would gate (receive only)"
 	default:
@@ -321,15 +407,13 @@ func (a *igate) relayLocked(lsf *m17.LSF, t tnc2, now time.Time) {
 	p.packet = m17.Packet{LSF: &l, Type: m17.PacketTypeAPRS, Payload: append([]byte(p.line), 0)}
 	p.packet.CalcCRC()
 	a.queue.push(p)
+	a.counts["relayQueued"]++
 	a.log.write(now, aprsEvent{Dir: aprsFromRF, M17: lsf.Src.Callsign(), Line: t.String(),
 		Result: "relay queued (" + p.class.String() + ")"})
 }
 
 // fromIS takes a packet from APRS-IS.
 func (a *igate) fromIS(line string) {
-	if !a.cfg.isToRF {
-		return
-	}
 	now := a.now()
 	t, err := parseTNC2(line)
 	if err != nil {
@@ -339,12 +423,27 @@ func (a *igate) fromIS(line string) {
 	}
 	a.mu.Lock()
 	defer a.mu.Unlock()
+	a.counts["isReceived"]++
+	if pos, ok := packetPosition(t); ok {
+		a.lastPosition[strings.ToUpper(t.src)] = posAt{pos, now}
+	}
 	p, reason := a.selectForRF(t, now)
-	if reason != "" {
+	switch {
+	case reason == dropWatched:
+		a.counts["isWatched"]++
+		a.log.write(now, aprsEvent{Dir: aprsFromIS, Line: line, Result: "watched"})
+		return
+	case reason != "":
+		a.counts["isNotSent"]++
 		log.Printf("[DEBUG] APRS: not gating to RF (%s): %s", reason, line)
 		a.log.write(now, aprsEvent{Dir: aprsFromIS, Line: line, Result: "not sent: " + reason})
 		return
+	case !a.cfg.isToRF:
+		a.counts["isWatched"]++
+		a.log.write(now, aprsEvent{Dir: aprsFromIS, Line: line, Result: "watched (IStoRF off)"})
+		return
 	}
+	a.counts["isQueued"]++
 	a.log.write(now, aprsEvent{Dir: aprsFromIS, Line: line, Result: "queued " + p.class.String()})
 	a.queue.push(p)
 	switch {
@@ -381,7 +480,12 @@ func (a *igate) selectForRF(t tnc2, now time.Time) (*gatedPacket, string) {
 		}
 		st := a.heard[strings.ToUpper(m.addressee)]
 		if st == nil || now.Sub(st.last) > a.cfg.heardWindow {
-			return nil, dropNotForRF
+			// Not for a station here: only the operator's rules want it,
+			// and then as any other traffic they bring.
+			if r := a.watchedLocked(t, now); r != "" {
+				return nil, r
+			}
+			break
 		}
 		if s := a.heard[src]; s != nil && now.Sub(s.last) < localSenderWindow {
 			return nil, dropSenderLocal
@@ -405,13 +509,8 @@ func (a *igate) selectForRF(t tnc2, now time.Time) (*gatedPacket, string) {
 		if isPos {
 			a.positions[src], a.positionTime[src] = t.String(), now
 		}
-		if a.cfg.filter == "" {
-			return nil, dropNotForRF
-		}
-		// The operator's own filter chose it. A local station's
-		// packets are on the air already.
-		if s := a.heard[src]; s != nil && now.Sub(s.last) < a.cfg.heardWindow {
-			return nil, dropSenderLocal
+		if r := a.watchedLocked(t, now); r != "" {
+			return nil, r
 		}
 	}
 	line, reason := isToRFLine(t, a.cfg.callsign, aprsToCall, a.cfg.wrap)
@@ -425,6 +524,23 @@ func (a *igate) selectForRF(t tnc2, now time.Time) (*gatedPacket, string) {
 	}
 	p.line, p.packet = line, *pkt
 	return p, ""
+}
+
+// watchedLocked applies the operator's rules to traffic the iGate rules
+// don't transmit: "" to transmit it, or the reason not to. Must be called
+// with a.mu held.
+func (a *igate) watchedLocked(t tnc2, now time.Time) string {
+	switch a.watchActionFor(t, now) {
+	case watchRF:
+		// A local station's packets are on the air already.
+		if s := a.heard[strings.ToUpper(t.src)]; s != nil && now.Sub(s.last) < a.cfg.heardWindow {
+			return dropSenderLocal
+		}
+		return ""
+	case watchDashboard:
+		return dropWatched
+	}
+	return dropNotForRF
 }
 
 // rfPacket builds the M17 packet for line, broadcast from the gateway, on
@@ -464,12 +580,18 @@ func (a *igate) courtesyFor(src string, lsfType [2]byte, now time.Time) {
 
 // buildFilter returns the server filter: messages to the stations heard on
 // RF (and to the gate, so that it is never empty), positions of senders
-// owed a courtesy position, and the operator's own filter. Must be called
-// with a.mu held, or before the gate starts.
+// owed a courtesy position, the operator's rules in force, and the raw
+// Filter. Must be called with a.mu held, or before the gate starts.
 func (a *igate) buildFilter() string {
 	f := "g/" + strings.Join(append([]string{a.cfg.callsign}, slices.Sorted(maps.Keys(a.heard))...), "/")
 	if len(a.courtesyDue) > 0 {
 		f += " b/" + strings.Join(slices.Sorted(maps.Keys(a.courtesyDue)), "/")
+	}
+	now := a.now()
+	for _, w := range a.cfg.watches {
+		if sf := w.serverFilter(a.cfg); sf != "" && w.active(now) {
+			f += " " + sf
+		}
 	}
 	if a.cfg.filter != "" {
 		f += " " + a.cfg.filter
@@ -480,9 +602,6 @@ func (a *igate) buildFilter() string {
 // updateFilterLocked sends the server a new filter if it has changed.
 // Must be called with a.mu held.
 func (a *igate) updateFilterLocked() {
-	if !a.cfg.isToRF {
-		return // nothing from APRS-IS is used
-	}
 	f := a.buildFilter()
 	if f == a.filter {
 		return
@@ -521,6 +640,7 @@ func (a *igate) expire(now time.Time) {
 			delete(a.positions, src)
 		}
 	}
+	maps.DeleteFunc(a.lastPosition, func(_ string, p posAt) bool { return now.Sub(p.at) > a.cfg.heardWindow })
 	a.updateFilterLocked()
 }
 
@@ -559,23 +679,30 @@ func (a *igate) run() {
 	delay := aprsReconnectMin
 	for {
 		a.mu.Lock()
-		filter := a.filter
-		if !a.cfg.isToRF {
-			filter = ""
-		}
+		cfg, filter, verified := a.cfg, a.filter, a.verified
 		a.mu.Unlock()
-		conn, err := fap.Dial(a.cfg.server, a.cfg.callsign, a.cfg.passcode, aprsAppName, aprsAppVersion, filter)
+		if !cfg.enabled {
+			select {
+			case <-a.done:
+				return
+			case <-a.reconf:
+			}
+			continue
+		}
+		conn, err := fap.Dial(cfg.server, cfg.callsign, cfg.passcode, aprsAppName, aprsAppVersion, filter)
 		if err != nil {
-			log.Printf("[INFO] APRS: unable to log in to %s: %v", a.cfg.server, err)
+			log.Printf("[INFO] APRS: unable to log in to %s: %v", cfg.server, err)
 		} else {
 			login := "receive only"
-			if a.verified {
+			if verified {
 				login = "verified"
 			}
-			log.Printf("[INFO] APRS: logged in to %s as %s (%s), filter %q", a.cfg.server, a.cfg.callsign, login, filter)
+			log.Printf("[INFO] APRS: logged in to %s as %s (%s), filter %q", cfg.server, cfg.callsign, login, filter)
 			delay = aprsReconnectMin
 			a.mu.Lock()
 			a.conn = conn
+			a.connectedAt = a.now()
+			a.server, a.serverLine = "", ""
 			a.mu.Unlock()
 			select {
 			case <-a.done:
@@ -585,10 +712,14 @@ func (a *igate) run() {
 			}
 			a.beacon()
 			for {
-				line, err := conn.ReadPacket(aprsReadTimeout)
+				line, err := conn.ReadLine(aprsReadTimeout)
 				if err != nil {
 					log.Printf("[INFO] APRS: lost APRS-IS connection: %v", err)
 					break
+				}
+				if strings.HasPrefix(line, "#") {
+					a.serverNote(line)
+					continue
 				}
 				a.fromIS(line)
 			}
@@ -600,28 +731,52 @@ func (a *igate) run() {
 		select {
 		case <-a.done:
 			return
+		case <-a.reconf:
+			delay = aprsReconnectMin
+			continue
 		case <-time.After(delay):
 		}
 		delay = min(2*delay, aprsReconnectMax)
 	}
 }
 
-// tick expires state, and beacons, until the gate closes.
-func (a *igate) tick() {
-	expire := time.NewTicker(aprsTick)
-	defer expire.Stop()
-	var beacon <-chan time.Time
-	if a.cfg.beaconInterval > 0 {
-		t := time.NewTicker(a.cfg.beaconInterval)
-		defer t.Stop()
-		beacon = t.C
+// serverNote keeps a comment line from the server, for the status file:
+// its keepalive names it, such as "# aprsc 2.1.14-g5e22b37 11 Oct 2026
+// 14:38:08 GMT T2RDU 66.226.147.251:14580".
+func (a *igate) serverNote(line string) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.serverLine, a.serverSeen = line, a.now()
+	f := strings.Fields(line)
+	if len(f) >= 3 && strings.Contains(f[len(f)-1], ":") {
+		a.server = f[len(f)-2]
 	}
+	if _, after, ok := strings.Cut(line, " server "); ok && strings.HasPrefix(line, "# logresp") {
+		a.server = strings.TrimSpace(after)
+	}
+}
+
+// tick expires state, beacons when due, and writes the status file, until
+// the gate closes.
+func (a *igate) tick() {
+	t := time.NewTicker(aprsStatusEvery)
+	defer t.Stop()
+	lastExpire := a.now()
 	for {
 		select {
-		case <-expire.C:
-			a.expire(a.now())
-		case <-beacon:
-			a.beacon()
+		case <-t.C:
+			now := a.now()
+			if now.Sub(lastExpire) >= aprsTick {
+				a.expire(now)
+				lastExpire = now
+			}
+			a.mu.Lock()
+			due := a.cfg.beaconInterval > 0 && now.Sub(a.lastBeacon) >= a.cfg.beaconInterval
+			a.mu.Unlock()
+			if due {
+				a.beacon()
+			}
+			a.writeStatus()
 		case <-a.done:
 			return
 		}
@@ -631,17 +786,26 @@ func (a *igate) tick() {
 // beacon sends the gate's position to APRS-IS, not RF, when one is set
 // and the login is verified.
 func (a *igate) beacon() {
-	if !a.cfg.hasPosition || a.cfg.beaconInterval <= 0 || !a.verified {
+	a.mu.Lock()
+	c, verified, connected := a.cfg, a.verified, a.conn != nil
+	if !c.hasPosition || c.beaconInterval <= 0 || !verified || !connected {
+		a.mu.Unlock()
 		return
 	}
-	pos, err := fap.EncodePosition(a.cfg.latitude, a.cfg.longitude, nil, nil, nil, a.cfg.symbol,
-		&fap.EncodePositionOpts{Comment: a.cfg.comment})
+	a.lastBeacon = a.now()
+	a.mu.Unlock()
+	pos, err := fap.EncodePosition(c.latitude, c.longitude, nil, nil, nil, c.symbol,
+		&fap.EncodePositionOpts{Comment: c.comment})
 	if err != nil {
 		log.Printf("[ERROR] APRS: beacon: %v", err)
 		return
 	}
-	line := a.cfg.callsign + ">" + aprsToCall + ",TCPIP*:" + pos
+	line := c.callsign + ">" + aprsToCall + ",TCPIP*:" + pos
 	log.Printf("[DEBUG] APRS: beacon %s", line)
 	a.send(line)
+	a.mu.Lock()
+	a.beaconLine = line
+	a.counts["beacons"]++
+	a.mu.Unlock()
 	a.log.write(a.now(), aprsEvent{Dir: aprsToIS, Line: line, Result: "beacon"})
 }
