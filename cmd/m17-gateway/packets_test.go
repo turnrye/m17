@@ -8,11 +8,12 @@ import (
 	"github.com/jancona/m17"
 )
 
-// recordingModem records when each packet is transmitted, and the frame
-// number of each voice frame.
+// recordingModem records when each packet is transmitted and its text, and
+// the frame number of each voice frame.
 type recordingModem struct {
 	mu    sync.Mutex
 	sent  []time.Time
+	texts []string
 	voice []uint16
 }
 
@@ -26,11 +27,18 @@ func (m *recordingModem) TransmitVoiceStream(sd m17.StreamDatagram) error {
 	m.voice = append(m.voice, sd.FrameNumber)
 	return nil
 }
-func (m *recordingModem) TransmitPacket(m17.Packet) error {
+func (m *recordingModem) TransmitPacket(p m17.Packet) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.sent = append(m.sent, time.Now())
+	m.texts = append(m.texts, p.SMSText())
 	return nil
+}
+
+func (m *recordingModem) sentTexts() []string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return append([]string(nil), m.texts...)
 }
 
 func (m *recordingModem) voiceFrames() []uint16 {
@@ -125,5 +133,75 @@ func TestPacketWaitsForOwnVoice(t *testing.T) {
 	sent := waitSent(t, m, 1)
 	if d := sent[0].Sub(sentVoice); d < gap {
 		t.Errorf("packet went %v after the last voice frame; gap is %v", d, gap)
+	}
+}
+
+// testGated sends gated packets from a new queue, without a rate limit.
+func testGated(t *testing.T, g *Gateway, gap time.Duration) *gatedQueue {
+	t.Helper()
+	q := newGatedQueue(time.Minute, 6000, 100, time.Now())
+	stop := make(chan struct{})
+	go g.sendGated(q, gap, stop)
+	t.Cleanup(func() { close(stop) })
+	return q
+}
+
+func gatedSMS(t *testing.T, text string) *gatedPacket {
+	t.Helper()
+	return &gatedPacket{class: gatedMessage, key: text, line: text, packet: smsPacket(t, text), queued: time.Now()}
+}
+
+// TestGatedSpaced: gated packets go one at a time, each at least minTxGap
+// after the one before.
+func TestGatedSpaced(t *testing.T) {
+	gap := 200 * time.Millisecond
+	g, m := testGateway(t, 10*time.Millisecond, 10*time.Millisecond)
+	q := testGated(t, g, gap)
+	for _, s := range []string{"one", "two", "three"} {
+		q.push(gatedSMS(t, s))
+	}
+	sent := waitSent(t, m, 3)
+	for i := 1; i < len(sent); i++ {
+		if d := sent[i].Sub(sent[i-1]); d < gap {
+			t.Errorf("gated packets %d and %d only %v apart; gap is %v", i-1, i, d, gap)
+		}
+	}
+}
+
+// TestGatedWaitsAfterRF: a gated packet waits minTxGap after local RF, not
+// just rxHoldoff, so that the next over can start first.
+func TestGatedWaitsAfterRF(t *testing.T) {
+	gap := 300 * time.Millisecond
+	g, m := testGateway(t, 50*time.Millisecond, 10*time.Millisecond)
+	q := testGated(t, g, gap)
+	g.rxStreamEnded()
+	ended := time.Now()
+	q.push(gatedSMS(t, "after the over"))
+	sent := waitSent(t, m, 1)
+	if d := sent[0].Sub(ended); d < gap {
+		t.Errorf("gated packet went %v after RF; gap is %v", d, gap)
+	}
+}
+
+// TestReflectorFirst: packets from the reflector, or the gateway's own,
+// go before gated ones, and a gated one still waits minTxGap after them.
+func TestReflectorFirst(t *testing.T) {
+	gap := 100 * time.Millisecond
+	g, m := testGateway(t, 10*time.Millisecond, 10*time.Millisecond)
+	slow := smsPacket(t, "slow")
+	g.enqueue(func() error {
+		time.Sleep(150 * time.Millisecond)
+		return m.TransmitPacket(slow)
+	}, slow)
+	time.Sleep(10 * time.Millisecond) // the sender has taken it
+	g.queueLocalPacket(smsPacket(t, "local"))
+	q := testGated(t, g, gap)
+	q.push(gatedSMS(t, "gated"))
+	sent := waitSent(t, m, 3)
+	if got := m.sentTexts(); got[0] != "slow" || got[1] != "local" || got[2] != "gated" {
+		t.Errorf("sent %v", got)
+	}
+	if d := sent[2].Sub(sent[1]); d < gap {
+		t.Errorf("gated packet went %v after the local one; gap is %v", d, gap)
 	}
 }

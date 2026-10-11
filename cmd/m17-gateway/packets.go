@@ -88,12 +88,18 @@ func (g *Gateway) queueLocalPacket(p m17.Packet) error {
 }
 
 func (g *Gateway) enqueue(send func() error, p m17.Packet) error {
+	g.tryEnqueue(send, p)
+	return nil
+}
+
+// tryEnqueue queues send, reporting whether there was room.
+func (g *Gateway) tryEnqueue(send func() error, p m17.Packet) bool {
 	select {
 	case g.packetQueue <- send:
-		return nil
+		return true
 	default:
 		log.Printf("[ERROR] Packet queue full; dropping packet %s", p)
-		return nil
+		return false
 	}
 }
 
@@ -105,10 +111,91 @@ func (g *Gateway) sendPackets() {
 		if err := send(); err != nil {
 			log.Printf("[ERROR] Error transmitting packet: %v", err)
 		}
-		g.stateMutex.Lock()
-		g.lastTX = time.Now()
-		g.stateMutex.Unlock()
+		g.packetSent()
 	}
+}
+
+// packetSent notes the end of a packet the gateway transmitted.
+func (g *Gateway) packetSent() {
+	g.stateMutex.Lock()
+	g.lastTX = time.Now()
+	g.stateMutex.Unlock()
+}
+
+// Packets from APRS-IS (aprs.go) wait in a gatedQueue, and are passed to
+// the packet sender above one at a time, so they share its channel checks,
+// and so that reflector and local packets go first. A gated packet also
+// waits until the channel has been quiet, both ways, for minTxGap: long
+// enough for a local station to key up, or answer the last over, before
+// it. A burst of gated packets therefore leaves a gap after each one.
+
+// sendGated passes gated packets to the packet sender until stop closes.
+func (g *Gateway) sendGated(q *gatedQueue, minTxGap time.Duration, stop <-chan struct{}) {
+	for {
+		if q.len() == 0 {
+			select {
+			case <-q.wake:
+			case <-stop:
+				return
+			}
+			continue
+		}
+		wait := g.gatedWait(time.Now(), minTxGap)
+		if wait <= 0 && len(g.packetQueue) > 0 {
+			wait = channelPoll
+		}
+		if wait <= 0 {
+			var p *gatedPacket
+			p, wait = q.next(time.Now())
+			if p != nil {
+				g.transmitGated(p, minTxGap)
+				continue
+			}
+			if wait <= 0 {
+				continue // the rest had expired
+			}
+		}
+		select {
+		case <-time.After(wait):
+		case <-stop:
+			return
+		}
+	}
+}
+
+// transmitGated sends p through the packet sender and waits until it has
+// gone, so that the next one is timed from its end.
+func (g *Gateway) transmitGated(p *gatedPacket, gap time.Duration) {
+	done := make(chan struct{})
+	send := func() error {
+		defer close(done)
+		// A packet queued just ahead of this one may have gone since it
+		// was handed over.
+		for wait := g.gatedWait(time.Now(), gap); wait > 0; wait = g.gatedWait(time.Now(), gap) {
+			time.Sleep(min(wait, channelPoll))
+		}
+		log.Printf("[INFO] APRS-IS to RF (%s, queued %v): %s", p.class, time.Since(p.queued).Round(time.Millisecond), p.line)
+		err := g.modem.TransmitPacket(p.packet)
+		g.packetSent()
+		return err
+	}
+	if g.tryEnqueue(send, p.packet) {
+		<-done
+	}
+}
+
+// gatedWait reports how long a gated packet must still wait at now: until
+// the channel is clear for any packet, and nothing has been received or
+// sent for gap.
+func (g *Gateway) gatedWait(now time.Time, gap time.Duration) time.Duration {
+	wait := g.channelWait(now)
+	g.stateMutex.Lock()
+	defer g.stateMutex.Unlock()
+	last := g.lastRX
+	if g.lastTX.After(last) {
+		last = g.lastTX
+	}
+	return max(wait, last.Add(gap).Sub(now))
 }
 
 // waitForChannel returns once the channel is clear (see channelWait).
