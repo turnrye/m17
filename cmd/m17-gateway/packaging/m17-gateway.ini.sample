@@ -114,10 +114,11 @@ ThirdParty=false
 ; the CAN, the linked reflector and Comment. For example
 ;   !3508.37NM09001.05W&PHG0330/441.112MHz M17 CAN0 M17-KCW B M17 hotspot
 ; Off without a position. Ambiguity 1 to 4 blurs the position, from about
-; 0.2 km to 110 km, for a hotspot at home.
+; 0.2 km to 110 km, for a hotspot at home. BeaconInterval is at least 5m;
+; 0 turns the beacon off.
 ; Latitude=35.1234
 ; Longitude=-90.1234
-BeaconInterval=30m
+BeaconInterval=10m
 Ambiguity=0
 ; Gateway symbol with an M overlay; APRS defines no M17 symbol.
 Symbol=M&

@@ -83,6 +83,10 @@ type aprsConfig struct {
 	watches        []watchRule
 }
 
+// minBeaconInterval is the shortest BeaconInterval taken, so that a slip
+// such as 10 for 10 minutes can't beacon to APRS-IS every few seconds.
+const minBeaconInterval = 5 * time.Minute
+
 func loadAPRSConfig(s *ini.Section) (aprsConfig, error) {
 	c := aprsConfig{
 		enabled:        s.Key("Enabled").MustBool(false),
@@ -102,7 +106,7 @@ func loadAPRSConfig(s *ini.Section) (aprsConfig, error) {
 		relay:          s.Key("Relay").MustBool(false),
 		relayHold:      s.Key("RelayHold").MustDuration(5 * time.Second),
 		holdVoice:      s.Key("HoldVoice").MustBool(true),
-		beaconInterval: s.Key("BeaconInterval").MustDuration(30 * time.Minute),
+		beaconInterval: s.Key("BeaconInterval").MustDuration(10 * time.Minute),
 		symbol:         s.Key("Symbol").MustString("M&"),
 		comment:        s.Key("Comment").String(),
 		can:            s.Key("CAN").MustInt(0),
@@ -112,6 +116,10 @@ func loadAPRSConfig(s *ini.Section) (aprsConfig, error) {
 		pathTag:        strings.ToUpper(strings.TrimSpace(s.Key("PathTag").MustString("M17"))),
 		logPath:        strings.TrimSpace(s.Key("Log").String()),
 		statusPath:     strings.TrimSpace(s.Key("Status").String()),
+	}
+	if c.beaconInterval > 0 && c.beaconInterval < minBeaconInterval {
+		log.Printf("[ERROR] APRS: BeaconInterval %v is under %v; using %v", c.beaconInterval, minBeaconInterval, minBeaconInterval)
+		c.beaconInterval = minBeaconInterval
 	}
 	var watchErrs []error
 	c.watches, watchErrs = loadWatches(s)

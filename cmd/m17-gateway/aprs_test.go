@@ -8,6 +8,7 @@ import (
 
 	fap "github.com/hessu/go-aprs-fap"
 	"github.com/jancona/m17"
+	"gopkg.in/ini.v1"
 )
 
 const testGate = "K0RET-10"
@@ -67,6 +68,30 @@ func queuedRF(a *igate, now time.Time) []*gatedPacket {
 			return out
 		}
 		out = append(out, p)
+	}
+}
+
+// TestBeaconInterval: the beacon defaults to every 10 minutes, and never
+// goes faster than every 5.
+func TestBeaconInterval(t *testing.T) {
+	for _, tc := range []struct {
+		set  string
+		want time.Duration
+	}{
+		{"", 10 * time.Minute},
+		{"BeaconInterval = 600s", 10 * time.Minute},
+		{"BeaconInterval = 10s", 5 * time.Minute},
+		{"BeaconInterval = 0", 0},
+		{"BeaconInterval = 1h", time.Hour},
+	} {
+		f, err := ini.Load([]byte("[APRS]\n" + tc.set))
+		if err != nil {
+			t.Fatal(err)
+		}
+		c, _ := loadAPRSConfig(f.Section("APRS"))
+		if c.beaconInterval != tc.want {
+			t.Errorf("%q: beacon every %v, want %v", tc.set, c.beaconInterval, tc.want)
+		}
 	}
 }
 

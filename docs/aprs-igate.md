@@ -71,7 +71,7 @@ The library's `LSF.CAN()` and `NewLSF(…, can)` handle only bits 8–10. That i
 
 ### 5. The gateway's own beacon
 
-**Chosen:** beacon to APRS-IS only, never RF. It goes out every 30 minutes (`BeaconInterval`), from the login call with only `TCPIP*` as the path, and only when `Latitude`/`Longitude` are set and the login is verified.
+**Chosen:** beacon to APRS-IS only, never RF. It goes out every 10 minutes (`BeaconInterval`, at least 5), from the login call with only `TCPIP*` as the path, and only when `Latitude`/`Longitude` are set and the login is verified.
 
 It is a position report that says how to reach the hotspot, in the APRS frequency format (aprs.org/info/freqspec.txt):
 
