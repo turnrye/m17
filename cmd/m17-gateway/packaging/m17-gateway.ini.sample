@@ -83,6 +83,10 @@ MaxQueueAge=60s
 ; received and sent, this long, so that a local station can always key up
 ; or answer an over first.
 MinTxGap=3s
+; Hold reflector voice while an APRS packet is being sent (about half a
+; second), and start it afresh after, so the two don't take the transmitter
+; from each other. The start of an over arriving mid-packet is lost.
+HoldVoice=true
 ; Packets from APRS-IS per minute, and in a burst.
 RateLimit=6
 RateBurst=3

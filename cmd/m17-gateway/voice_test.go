@@ -66,14 +66,19 @@ func TestNetVoiceWaitsForSpeaking(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	g.speaking.Store(true)
-	for fn := range uint16(5) {
+	release := g.holdVoice()
+	inner := g.holdVoice() // an APRS packet during an announcement
+	for fn := range uint16(3) {
+		send(fn)
+	}
+	inner()
+	for fn := uint16(3); fn < 5; fn++ {
 		send(fn)
 	}
 	if got := m.voiceFrames(); len(got) > 0 {
 		t.Fatalf("frames %v transmitted while the gateway spoke", got)
 	}
-	g.speaking.Store(false)
+	release()
 	send(5)
 	send(6 | 0x8000)
 	if got, want := m.voiceFrames(), []uint16{5, 6 | 0x8000}; !slices.Equal(got, want) {

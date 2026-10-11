@@ -229,6 +229,11 @@ IS→RF packets wait in their own queue, ordered acks > messages > other. A sche
 
 The last check is repeated just before transmitting, in case a reflector packet went in the meantime. The next packet is timed from the end of the last one, so a burst always leaves a `MinTxGap` gap a local station can key up in.
 
+**While a packet is going out**, reflector voice is held back, as it is for local RF and for the gateway's own announcements. The stream is then joined with a fresh LSF. Without that, an over starting mid-packet would take the transmitter from the packet and back again, frame by frame, each time with an EOT and a new LSF. That was seen live with an announcement on a busy reflector: 90 switches in 18 s.
+- **Cost:** at most the half second or so a packet takes, from the start of an over.
+- **Setting:** `HoldVoice` (on by default) turns it off.
+- **On a busy reflector:** packets go only at turnovers of at least `MinTxGap` (3 s). On M17-KCW A, with the transmitter busy 87 % of the time, they waited 9–23 s each, and one expired at 30 s. A shorter `MinTxGap` uses more turnovers, but leaves local stations less time to answer.
+
 **When more arrives than the channel can carry**, traffic for nobody in particular is what gives way. That is the `other` class: what watch rules bring, and courtesy positions.
 
 - **Last in line:** it goes only when no ack or message is waiting.

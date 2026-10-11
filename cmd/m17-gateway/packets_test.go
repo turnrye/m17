@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/jancona/m17"
+	"github.com/jancona/m17/inet"
 )
 
 // recordingModem records when each packet is transmitted and its text, and
@@ -180,6 +181,45 @@ func TestGatedWaitsAfterRF(t *testing.T) {
 	sent := waitSent(t, m, 1)
 	if d := sent[0].Sub(ended); d < gap {
 		t.Errorf("gated packet went %v after RF; gap is %v", d, gap)
+	}
+}
+
+// slowModem takes a while to transmit a packet, as a real one does.
+type slowModem struct {
+	recordingModem
+}
+
+func (m *slowModem) TransmitPacket(p m17.Packet) error {
+	time.Sleep(150 * time.Millisecond)
+	return m.recordingModem.TransmitPacket(p)
+}
+
+// TestGatedHoldsVoice: reflector voice arriving while an APRS packet is
+// sent waits for it, unless HoldVoice is off.
+func TestGatedHoldsVoice(t *testing.T) {
+	for _, hold := range []bool{true, false} {
+		m := &slowModem{}
+		g := &Gateway{modem: m, state: Idle, lastStreamID: 0xFFFF, rxHoldoff: time.Millisecond,
+			packetGap: time.Millisecond, packetQueue: make(chan func() error, packetQueueLen)}
+		g.link.Store(&inet.Client{})
+		g.aprs = &igate{cfg: aprsConfig{holdVoice: hold}, stats: newAPRSStats(), now: time.Now}
+		go g.sendPackets()
+		lsf, err := m17.NewLSF("@ALL", "W7GKB D", m17.LSFTypeStream, m17.LSFDataTypeVoice, 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		done := make(chan struct{})
+		go func() {
+			g.transmitGated(gatedSMS(t, "packet"), time.Millisecond)
+			close(done)
+		}()
+		time.Sleep(50 * time.Millisecond) // the packet is going out
+		g.TransmitVoiceStream(m17.NewStreamDatagram(0x6425, 0, &lsf, make([]byte, 16)))
+		<-done
+		close(g.packetQueue)
+		if got := len(m.voiceFrames()); (got == 0) != hold {
+			t.Errorf("HoldVoice %v: %d voice frames sent during the packet", hold, got)
+		}
 	}
 }
 

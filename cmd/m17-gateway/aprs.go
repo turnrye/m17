@@ -66,6 +66,7 @@ type aprsConfig struct {
 	wrap           bool
 	relay          bool
 	relayHold      time.Duration
+	holdVoice      bool // hold reflector voice while a packet is sent
 	beaconInterval time.Duration
 	hasPosition    bool
 	latitude       float64
@@ -100,6 +101,7 @@ func loadAPRSConfig(s *ini.Section) (aprsConfig, error) {
 		wrap:           s.Key("ThirdParty").MustBool(false),
 		relay:          s.Key("Relay").MustBool(false),
 		relayHold:      s.Key("RelayHold").MustDuration(5 * time.Second),
+		holdVoice:      s.Key("HoldVoice").MustBool(true),
 		beaconInterval: s.Key("BeaconInterval").MustDuration(30 * time.Minute),
 		symbol:         s.Key("Symbol").MustString("M&"),
 		comment:        s.Key("Comment").String(),
@@ -283,6 +285,13 @@ func (a *igate) linkInfo() string {
 		return ""
 	}
 	return a.link()
+}
+
+// holdsVoice reports whether reflector voice waits while a packet is sent.
+func (a *igate) holdsVoice() bool {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.cfg.holdVoice
 }
 
 // minTxGap returns the gap before a packet from APRS-IS.

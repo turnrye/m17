@@ -178,6 +178,9 @@ func (g *Gateway) transmitGated(p *gatedPacket, gap time.Duration) {
 		}
 		waited := time.Since(p.queued).Round(time.Millisecond)
 		log.Printf("[INFO] APRS-IS to RF (%s, queued %v): %s", p.class, waited, p.line)
+		if g.aprs == nil || g.aprs.holdsVoice() {
+			defer g.holdVoice()()
+		}
 		err := g.modem.TransmitPacket(p.packet)
 		g.packetSent()
 		if err == nil && p.sent != nil {
