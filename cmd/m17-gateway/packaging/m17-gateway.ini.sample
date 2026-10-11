@@ -29,6 +29,48 @@ OverrideHostFile=/opt/m17/m17-gateway/OverrideHosts.txt
 Name=M17-M17
 Module=C
 
+[APRS]
+; Gate APRS packets carried in M17 packet mode (type 0x02, a TNC2 line) between
+; RF and APRS-IS, as an iGate does. See docs/aprs-igate.md.
+Enabled=false
+Server=rotate.aprs2.net:14580
+; The gate's own APRS callsign, an AX.25 one such as N0CALL-10. Radios take
+; packets from APRS-IS with it in their path, so it can't have a letter SSID.
+Callsign=
+; -1 logs in receive only: nothing is sent to APRS-IS, and what would be is
+; logged instead.
+Passcode=-1
+; Gate packets heard on RF to APRS-IS.
+RFtoIS=true
+; Transmit messages from APRS-IS to stations heard on RF in the last
+; HeardWindow. Every one is airtime nobody can talk in.
+IStoRF=false
+; An extra APRS-IS server filter. Everything it selects is transmitted too,
+; except from stations heard on RF. Leave empty for messages only.
+Filter=
+HeardWindow=60m
+; A packet from APRS-IS waits for a quiet channel at most this long; senders
+; retry anyway.
+MaxQueueAge=60s
+; Before each packet from APRS-IS, the channel must have been quiet, both
+; received and sent, this long, so that a local station can always key up
+; or answer an over first.
+MinTxGap=3s
+; Packets from APRS-IS per minute, and in a burst.
+RateLimit=6
+RateBurst=3
+; After a message, send its sender's position, once per 30 minutes.
+CourtesyPosition=true
+; Send packets whose addresses AX.25 can't hold (WINLINK, KD7ZYN-S) in
+; third-party form, for radios that unwrap it, rather than skipping them.
+ThirdParty=false
+; Beacon the gate's position to APRS-IS, never to RF. Off without a position.
+; Latitude=35.1234
+; Longitude=-90.1234
+BeaconInterval=30m
+Symbol=I&
+Comment=M17 hotspot
+
 [Log]
 ; Logging levels: ERROR, INFO, DEBUG
 Level=DEBUG

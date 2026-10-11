@@ -53,6 +53,7 @@ type config struct {
 	hostfile         *inet.Hostfile
 	overrideHostfile *inet.Hostfile
 	audioDir         string
+	aprs             aprsConfig
 }
 
 func loadConfig(iniFile string, inFile string, outFile string) (config, error) {
@@ -88,6 +89,7 @@ func loadConfig(iniFile string, inFile string, outFile string) (config, error) {
 	logLevel := cfg.Section("Log").Key("Level").String()
 	logPath := cfg.Section("Log").Key("Path").String()
 	logRoot := cfg.Section("Log").Key("Root").String()
+	aprsCfg, aprsErr := loadAPRSConfig(cfg.Section("APRS"))
 	var modemType string
 	var modemTypeErr error
 	if !cfg.Section("Modem").HasKey("Type") {
@@ -185,6 +187,7 @@ func loadConfig(iniFile string, inFile string, outFile string) (config, error) {
 		dashboardLogErr,
 		reflectorHostfileErr,
 		reflectorOverrideHostfileErr,
+		aprsErr,
 	)
 
 	return config{
@@ -214,6 +217,7 @@ func loadConfig(iniFile string, inFile string, outFile string) (config, error) {
 		hostfile:         reflectorHostfile,
 		overrideHostfile: reflectorOverrideHostfile,
 		audioDir:         audioDir,
+		aprs:             aprsCfg,
 	}, err
 }
 
@@ -365,6 +369,7 @@ type Gateway struct {
 	rfDirectLogged bool // and a warning that it will probably be dropped was logged
 	echoStream     []m17.StreamDatagram
 	audioClips     map[string][]byte
+	aprs           *igate // nil unless [APRS] Enabled
 }
 
 func NewGateway(cfg config, modem modem.Modem) (*Gateway, error) {
@@ -391,6 +396,13 @@ func NewGateway(cfg config, modem modem.Modem) (*Gateway, error) {
 		packetQueue:      make(chan func() error, packetQueueLen),
 	}
 	go g.sendPackets()
+	if cfg.aprs.enabled {
+		g.aprs = newIgate(cfg.aprs, cfg.callsign)
+		if g.aprs.queue != nil {
+			go g.sendGated(g.aprs.queue, cfg.aprs.minTxGap, g.aprs.done)
+		}
+		g.aprs.start()
+	}
 	err = g.loadAudioClips(cfg.audioDir, cfg.callsign)
 	if err != nil {
 		return nil, err
@@ -669,6 +681,9 @@ func (g *Gateway) receivedRFPacket(lsf m17.LSF, payload []byte, ber float64) err
 		go g.infoPacket(p)
 	default:
 		log.Printf("[DEBUG] receivedRFPacket() packet dst: %s", lsf.Dst.Callsign())
+		if g.aprs != nil && p.Type == m17.PacketTypeAPRS {
+			g.aprs.fromRF(&lsf, p.Payload)
+		}
 		if g.inetClient != nil && g.inetClient.Legacy() {
 			log.Printf("[INFO] Not sending packet to %s: legacy reflectors don't support packet mode", g.inetClient.Name)
 		} else if g.inetClient != nil {
@@ -739,6 +754,9 @@ func (g *Gateway) Run() {
 func (g *Gateway) Close() {
 	log.Print("[DEBUG] Gateway.Close()")
 	g.done = true
+	if g.aprs != nil {
+		g.aprs.close()
+	}
 	if g.inetClient != nil {
 		g.inetClient.Close()
 	}
