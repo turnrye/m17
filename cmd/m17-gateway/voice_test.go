@@ -15,7 +15,7 @@ import (
 func TestNetVoiceWaitsForRF(t *testing.T) {
 	holdoff := 100 * time.Millisecond
 	g, m := testGateway(t, holdoff, 10*time.Millisecond)
-	g.inetClient = &inet.Client{}
+	g.link.Store(&inet.Client{})
 	lsf, err := m17.NewLSF("@ALL", "W2JJT C", m17.LSFTypeStream, m17.LSFDataTypeVoice, 0)
 	if err != nil {
 		t.Fatal(err)
@@ -55,7 +55,7 @@ func TestNetVoiceWaitsForRF(t *testing.T) {
 // voice waits only rfTurnaround, not the full rxHoldoff.
 func TestNetVoiceAfterRFStreamEnd(t *testing.T) {
 	g, m := testGateway(t, 5*rfTurnaround, 10*time.Millisecond)
-	g.inetClient = &inet.Client{}
+	g.link.Store(&inet.Client{})
 	lsf, err := m17.NewLSF("@ALL", "PARROT", m17.LSFTypeStream, m17.LSFDataTypeVoice, 0)
 	if err != nil {
 		t.Fatal(err)

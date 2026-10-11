@@ -10,8 +10,8 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
-	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -55,6 +55,7 @@ type config struct {
 	overrideHostfile *inet.Hostfile
 	audioDir         string
 	aprs             aprsConfig
+	link             linkConfig
 	path             string // the configuration file
 }
 
@@ -92,6 +93,7 @@ func loadConfig(iniFile string, inFile string, outFile string) (config, error) {
 	logPath := cfg.Section("Log").Key("Path").String()
 	logRoot := cfg.Section("Log").Key("Root").String()
 	aprsCfg, aprsErr := loadAPRSConfig(cfg.Section("APRS"))
+	linkCfg := loadLinkConfig(cfg.Section("Reflector"))
 	var modemType string
 	var modemTypeErr error
 	if !cfg.Section("Modem").HasKey("Type") {
@@ -220,6 +222,7 @@ func loadConfig(iniFile string, inFile string, outFile string) (config, error) {
 		overrideHostfile: reflectorOverrideHostfile,
 		audioDir:         audioDir,
 		aprs:             aprsCfg,
+		link:             linkCfg,
 		path:             iniFile,
 	}, err
 }
@@ -347,7 +350,13 @@ type Gateway struct {
 	modem            modem.Modem
 	in               *os.File
 	out              *os.File
-	inetClient       *inet.Client
+	link             atomic.Pointer[inet.Client] // the reflector; nil when unlinked
+	linkMu           sync.Mutex                  // serialises link changes; guards linkedBy, linkedAt
+	linkCfg          linkConfig
+	linkedBy         string // who made the last link change, "startup" or "revert"
+	linkedAt         time.Time
+	pendingLink      *linkCommand // asked for by the RF stream being received
+	stop             chan struct{}
 	duplex           bool
 	done             bool
 	dashLog          *dashboard.Logger
@@ -397,6 +406,8 @@ func NewGateway(cfg config, modem modem.Modem) (*Gateway, error) {
 		rxHoldoff:        cfg.rxHoldoff,
 		packetGap:        cfg.packetGap,
 		packetQueue:      make(chan func() error, packetQueueLen),
+		linkCfg:          cfg.link,
+		stop:             make(chan struct{}),
 	}
 	go g.sendPackets()
 	if cfg.aprs.enabled {
@@ -407,10 +418,7 @@ func NewGateway(cfg config, modem modem.Modem) (*Gateway, error) {
 		g.aprs = newIgate(cfg.aprs, cfg.callsign)
 		g.aprs.duplex = cfg.duplex
 		g.aprs.radio = radioInfo{cfg.rxFrequency, cfg.txFrequency, cfg.power}
-		if cfg.defaultReflector != "" {
-			link := cfg.defaultReflector + " " + cfg.defaultModule
-			g.aprs.link = func() string { return strings.TrimSpace(link) }
-		}
+		g.aprs.link = func() string { return linkName(g.reflector()) }
 		if cfg.aprs.logPath != "" {
 			g.aprs.log, err = openAPRSLog(cfg.aprs.logPath)
 			if err != nil {
@@ -429,33 +437,14 @@ func NewGateway(cfg config, modem modem.Modem) (*Gateway, error) {
 		// No reflector: RF only. Nothing is sent to or received from the
 		// network; local RF works as usual, and a duplex hotspot repeats.
 		log.Printf("[INFO] No reflector configured: RF only")
-	} else {
-		var h inet.Host
-		var ok bool
-		if g.overrideHostfile != nil {
-			h, ok = g.overrideHostfile.Hosts[g.Name]
-		}
-		if !ok && g.hostfile != nil {
-			h, ok = g.hostfile.Hosts[g.Name]
-		}
-		if !ok {
-			return nil, fmt.Errorf("reflector %s not found", g.Name)
-		}
-		g.Server = h.Server
-		g.Port = h.Port
-		log.Printf("[DEBUG] Connecting to %s, %s:%d, module %s", g.Name, g.Server, g.Port, g.Module)
-		g.inetClient, err = inet.NewClient(g.Name, g.Server, g.Port, g.Module, cfg.callsign, func(event, name string, module byte) {
-			g.dashLog.Log("Reflector", event, "name", name, "module", string(module))
-		}, g.queuePacket, g.TransmitVoiceStream)
-		if err != nil {
-			return nil, fmt.Errorf("error creating client: %v", err)
-		}
-		g.inetClient.ProbeReflector = true
-		err = g.inetClient.Connect()
-		if err != nil {
-			return nil, fmt.Errorf("error connecting to %s %s:%d %s: %v", g.Name, g.Server, g.Port, g.Module, err)
-		}
+	} else if err := g.linkTo(g.Name, g.Module, "startup"); err != nil {
+		return nil, err
 	}
+	if g.linkCfg.rfLinking {
+		log.Printf("[INFO] The reflector link can be changed over RF; back to %q after %v with nothing received",
+			g.home(), g.linkCfg.revertAfter)
+	}
+	go g.revertLoop(g.stop)
 
 	modem.Start()
 
@@ -468,7 +457,11 @@ func (g *Gateway) transmitNetPacket(p m17.Packet) error {
 	lsf := *p.LSF
 	// Replace META with Extended Callsign Data
 	// Don't swap Src for Packet
-	p.LSF.SetECD(&g.encodedCallsign, g.inetClient.EncodedName)
+	var refl *m17.EncodedCallsign
+	if c := g.reflector(); c != nil {
+		refl = c.EncodedName
+	}
+	p.LSF.SetECD(&g.encodedCallsign, refl)
 	//	p.LSF.Src = g.encodedCallsign
 	err := g.modem.TransmitPacket(p)
 	if err != nil {
@@ -494,7 +487,11 @@ func (g *Gateway) TransmitVoiceStream(sd m17.StreamDatagram) error {
 	// Shouldn't need the next line with modern reflectors
 	// sd.LSF.Dst = *callsignAll
 	// Replace META with Extended Callsign Data
-	sd.LSF.SetECD(&sd.LSF.Src, g.inetClient.EncodedName)
+	var refl *m17.EncodedCallsign
+	if c := g.reflector(); c != nil {
+		refl = c.EncodedName
+	}
+	sd.LSF.SetECD(&sd.LSF.Src, refl)
 	sd.LSF.Src = g.encodedCallsign
 	sd.LSF.CalcCRC()
 	// Local RF takes precedence. While a radio is transmitting to us, hold
@@ -574,18 +571,25 @@ func (g *Gateway) receivedRFLSF(lsf m17.LSF, ber float64) error {
 		g.dashLog.LogFrame(&lsf, "RF", "Voice Start", "mer", json.Number(fmt.Sprintf("%f", ber)))
 		g.dashLog.LogGNSS(&lsf, "RF")
 		switch lsf.Dst.Callsign() {
-		case "/ECHO", "#ECHO":
+		case "/ECHO", "#ECHO", "ECHO":
 			log.Printf("[DEBUG] receivedRFLSF() Echo")
 			g.setState(Echo)
 			g.echoStreamStart()
-		case "/INFO", "#INFO":
+		case "/INFO", "#INFO", "INFO":
 			log.Printf("[DEBUG] receivedRFLSF() Info")
 			g.setState(LocalCommand)
 		default:
+			if cmd, ok := g.linkCommandFor(lsf); ok {
+				log.Printf("[DEBUG] receivedRFLSF() link command from %s: %s", cmd.from, lsf.Dst.Callsign())
+				g.pendingLink = &cmd
+				g.setState(LocalCommand)
+				break
+			}
 			log.Printf("[DEBUG] receivedRFLSF() RFStream: %s", lsf.Dst.Callsign())
 			// Decided once per stream, so that the probe finishing
 			// mid-stream cannot readdress it partway through.
-			g.rfToLegacy = g.inetClient != nil && g.inetClient.Legacy()
+			c := g.reflector()
+			g.rfToLegacy = c != nil && c.Legacy()
 			g.rfDirectLogged = false
 			g.setState(RFStreamRX)
 		}
@@ -609,8 +613,8 @@ func (g *Gateway) receivedRFStreamFrame(lsf m17.LSF, payload []byte, sid, fn uin
 	case Echo:
 		g.echoStreamRecord(sd)
 	case RFStreamRX:
-		if g.inetClient != nil {
-			err = g.inetClient.SendStream(g.streamForReflector(sd))
+		if c := g.reflector(); c != nil {
+			err = c.SendStream(g.streamForReflector(c, sd))
 		}
 		if g.duplex {
 			// Replace META with Extended Callsign Data
@@ -649,11 +653,16 @@ func (g *Gateway) receivedRFStreamEOT(lsf m17.LSF, sid, fn uint16, ber float64) 
 		go g.echoStreamEnd()
 	case LocalCommand:
 		switch lsf.Dst.Callsign() {
-		case "/INFO", "#INFO":
-			if g.inetClient != nil {
-				go g.playMessage("welcome", "callsign", "is_linked_to", g.inetClient.Name+" "+string(g.inetClient.Module))
+		case "/INFO", "#INFO", "INFO":
+			if c := g.reflector(); c != nil {
+				go g.playMessage("welcome", "callsign", "is_linked_to", linkName(c))
 			} else {
 				go g.playMessage("welcome", "callsign", "is_unlinked")
+			}
+		default:
+			if g.pendingLink != nil {
+				go g.runLinkCommand(*g.pendingLink)
+				g.pendingLink = nil
 			}
 		}
 	case RFStreamRX:
@@ -689,11 +698,11 @@ func (g *Gateway) receivedRFPacket(lsf m17.LSF, payload []byte, ber float64) err
 		g.dashLog.LogFrame(&lsf, "RF", "Packet", "mer", json.Number(fmt.Sprintf("%f", ber)), "packetType", p.Type)
 	}
 	switch lsf.Dst.Callsign() {
-	case "/ECHO", "#ECHO":
+	case "/ECHO", "#ECHO", "ECHO":
 		g.setState(Echo)
 		log.Printf("[DEBUG] receivedRFPacket() Echo")
 		go g.echoPacket(p)
-	case "/INFO", "#INFO":
+	case "/INFO", "#INFO", "INFO":
 		g.setState(LocalCommand)
 		log.Printf("[DEBUG] receivedRFPacket() Info")
 		go g.infoPacket(p)
@@ -702,10 +711,10 @@ func (g *Gateway) receivedRFPacket(lsf m17.LSF, payload []byte, ber float64) err
 		if g.aprs != nil && p.Type == m17.PacketTypeAPRS {
 			g.aprs.fromRF(&lsf, p.Payload)
 		}
-		if g.inetClient != nil && g.inetClient.Legacy() {
-			log.Printf("[INFO] Not sending packet to %s: legacy reflectors don't support packet mode", g.inetClient.Name)
-		} else if g.inetClient != nil {
-			err = g.inetClient.SendPacket(p)
+		if c := g.reflector(); c != nil && c.Legacy() {
+			log.Printf("[INFO] Not sending packet to %s: legacy reflectors don't support packet mode", c.Name)
+		} else if c != nil {
+			err = c.SendPacket(p)
 		}
 		if g.duplex {
 			// Repeat whether or not the reflector send worked, as for voice.
@@ -726,20 +735,20 @@ func (g *Gateway) receivedRFPacket(lsf m17.LSF, payload []byte, ber float64) err
 // stream (to PARROT, or a callsign) is sent unchanged, though the
 // reflector will probably drop it. The LSF is copied, not changed in
 // place: in duplex, sd is repeated on RF as received.
-func (g *Gateway) streamForReflector(sd m17.StreamDatagram) m17.StreamDatagram {
+func (g *Gateway) streamForReflector(c *inet.Client, sd m17.StreamDatagram) m17.StreamDatagram {
 	if !g.rfToLegacy {
 		return sd
 	}
 	if !m17.IsBroadcast(sd.LSF.Dst) {
 		if !g.rfDirectLogged {
 			log.Printf("[INFO] Legacy reflector %s will probably drop stream %04x to %s: it forwards only broadcasts",
-				g.inetClient.Name, sd.StreamID, sd.LSF.Dst.Callsign())
+				c.Name, sd.StreamID, sd.LSF.Dst.Callsign())
 			g.rfDirectLogged = true
 		}
 		return sd
 	}
 	lsf := *sd.LSF
-	lsf.Dst = *g.inetClient.EncodedName
+	lsf.Dst = *c.EncodedName
 	lsf.CalcCRC()
 	sd.LSF = &lsf
 	return sd
@@ -775,8 +784,11 @@ func (g *Gateway) Close() {
 	if g.aprs != nil {
 		g.aprs.close()
 	}
-	if g.inetClient != nil {
-		g.inetClient.Close()
+	if g.stop != nil {
+		close(g.stop)
+	}
+	if c := g.link.Swap(nil); c != nil {
+		c.Close()
 	}
 	if g.modem != nil {
 		g.modem.Close()
@@ -808,8 +820,8 @@ func (g *Gateway) infoPacket(p m17.Packet) error {
 	p.LSF.Src = g.encodedCallsign
 	p.LSF.CalcCRC()
 	msg := g.callsign + " is not linked to a reflector"
-	if g.inetClient != nil {
-		msg = g.callsign + " is linked to " + g.inetClient.Name + " " + string(g.inetClient.Module)
+	if c := g.reflector(); c != nil {
+		msg = g.callsign + " is linked to " + linkName(c)
 	}
 	p.Payload = append(([]byte)(msg), 0) // NULL terminate the string
 	p.CalcCRC()

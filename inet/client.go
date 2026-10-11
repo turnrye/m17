@@ -7,6 +7,7 @@ import (
 	"net"
 	"os"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/jancona/m17"
@@ -64,7 +65,8 @@ type Client struct {
 	retryCount      int
 	packetHandler   func(m17.Packet) error
 	streamHandler   func(m17.StreamDatagram) error
-	running         bool
+	running         atomic.Bool // handle() is reading
+	closed          atomic.Bool // Close() was called: never reconnect
 	events          EventFunc
 
 	// ProbeReflector, set before Connect, makes the client find out on
@@ -115,10 +117,10 @@ func NewClient(name string, server string, port uint, module string, callsign st
 			r.stopProbe()
 			r.event("Disconnect")
 			r.retryCount = 0
-			for !r.connected && r.retryCount < maxRetries {
+			for !r.connected && r.retryCount < maxRetries && !r.closed.Load() {
 				// Close connection before retrying
 				r.conn.Close()
-				for r.running {
+				for r.running.Load() {
 					log.Printf("[DEBUG] Waiting for handler to stop...")
 					time.Sleep(10 * time.Second)
 				}
@@ -164,7 +166,8 @@ func (r *Client) Connect() error {
 }
 func (r *Client) Close() error {
 	log.Print("[DEBUG] Client.Close()")
-	r.running = false
+	r.closed.Store(true)
+	r.running.Store(false)
 	r.pingTimer.Stop()
 	r.stopProbe()
 	r.sendDISC()
@@ -173,7 +176,7 @@ func (r *Client) Close() error {
 }
 
 func (r *Client) handle() {
-	r.running = true
+	r.running.Store(true)
 	connGap := connRetryInterval // wait before resending an unanswered CONN
 	for r.connected || r.connecting {
 		wait := 10 * time.Second
@@ -201,7 +204,7 @@ func (r *Client) handle() {
 				continue
 			case errors.Is(err, net.ErrClosed):
 				log.Printf("[DEBUG] Client.Handle(): connection closed")
-				r.running = false
+				r.running.Store(false)
 			default:
 				// A UDP socket reports "connection refused" when nothing
 				// was listening for an earlier datagram. Keep going: the
@@ -286,7 +289,7 @@ func (r *Client) handle() {
 			}
 		}
 	}
-	r.running = false
+	r.running.Store(false)
 }
 
 // Legacy reports whether the reflector is a legacy one (all urfd, and mrefd

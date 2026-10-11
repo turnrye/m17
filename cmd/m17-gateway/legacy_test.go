@@ -118,16 +118,17 @@ func linkedGateway(t *testing.T, parrot bool) (*Gateway, *lsfModem, *fakeReflect
 	go g.sendPackets()
 	t.Cleanup(func() { close(g.packetQueue) })
 
-	g.inetClient, err = inet.NewClient("M17-QTC", "127.0.0.1", uint(refl.conn.LocalAddr().(*net.UDPAddr).Port), "A",
+	c, err := inet.NewClient("M17-QTC", "127.0.0.1", uint(refl.conn.LocalAddr().(*net.UDPAddr).Port), "A",
 		g.callsign, nil, g.queuePacket, g.TransmitVoiceStream)
 	if err != nil {
 		t.Fatal(err)
 	}
-	g.inetClient.ProbeReflector = true
-	if err := g.inetClient.Connect(); err != nil {
+	c.ProbeReflector = true
+	if err := c.Connect(); err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { g.inetClient.Close() })
+	g.link.Store(c)
+	t.Cleanup(func() { c.Close() })
 
 	deadline := time.Now().Add(2 * time.Second)
 	for {
@@ -136,7 +137,7 @@ func linkedGateway(t *testing.T, parrot bool) (*Gateway, *lsfModem, *fakeReflect
 			time.Sleep(50 * time.Millisecond) // for the reply
 			break
 		}
-		if !parrot && g.inetClient.Legacy() {
+		if !parrot && g.reflector().Legacy() {
 			break
 		}
 		if time.Now().After(deadline) {
@@ -144,7 +145,7 @@ func linkedGateway(t *testing.T, parrot bool) (*Gateway, *lsfModem, *fakeReflect
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
-	if g.inetClient.Legacy() == parrot {
+	if g.reflector().Legacy() == parrot {
 		t.Fatalf("Legacy() = %v for a reflector that answers PARROT: %v", !parrot, parrot)
 	}
 	return g, m, refl
@@ -216,7 +217,7 @@ func TestLegacyBroadcastReaddressed(t *testing.T) {
 		t.Run(dst, func(t *testing.T) {
 			g, m, refl := linkedGateway(t, false)
 			rfStream(t, g, dst)
-			want := *g.inetClient.EncodedName
+			want := *g.reflector().EncodedName
 			for i, got := range waitStreams(t, refl, 3) {
 				if got != want {
 					t.Errorf("frame %d to reflector: DST %s, want %s", i, got.Callsign(), want.Callsign())

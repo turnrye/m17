@@ -28,6 +28,18 @@ OverrideHostFile=/opt/m17/m17-gateway/OverrideHosts.txt
 ; still repeats.
 Name=M17-M17
 Module=C
+; Let local stations change the link over RF, as on M17Gateway: transmit to a
+; reflector and module in the host files, such as "M17-M17 C", to link there,
+; or to "UNLINK"; the gateway says what it did. Off by default.
+RFLinking=false
+; Who may do it, separated by commas, with * for any SSID or suffix, such as
+; N0CALL*. Empty lets anyone in range.
+LinkCallsigns=
+; Go back to Name/Module above once nothing has been received on RF for this
+; long. 0 stays put until a restart.
+RevertAfter=15m
+; The link, who changed it, and when it goes back, as JSON for the dashboard.
+LinkStatus=/opt/m17/m17-gateway/link-status.json
 
 [APRS]
 ; Gate APRS packets carried in M17 packet mode (type 0x02, a TNC2 line) between
