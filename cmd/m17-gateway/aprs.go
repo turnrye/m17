@@ -72,6 +72,10 @@ type aprsConfig struct {
 	longitude      float64
 	symbol         string
 	comment        string
+	can            int     // the CAN radios use here, for the beacon
+	haat           float64 // antenna height above average terrain, m
+	gain           float64 // antenna gain, dBi
+	ambiguity      int     // beacon position ambiguity, 0 to 4
 	logPath        string
 	statusPath     string
 	watches        []watchRule
@@ -96,8 +100,12 @@ func loadAPRSConfig(s *ini.Section) (aprsConfig, error) {
 		relay:          s.Key("Relay").MustBool(false),
 		relayHold:      s.Key("RelayHold").MustDuration(5 * time.Second),
 		beaconInterval: s.Key("BeaconInterval").MustDuration(30 * time.Minute),
-		symbol:         s.Key("Symbol").MustString("I&"),
+		symbol:         s.Key("Symbol").MustString("M&"),
 		comment:        s.Key("Comment").String(),
+		can:            s.Key("CAN").MustInt(0),
+		haat:           s.Key("HAAT").MustFloat64(0),
+		gain:           s.Key("Gain").MustFloat64(0),
+		ambiguity:      s.Key("Ambiguity").MustInt(0),
 		logPath:        strings.TrimSpace(s.Key("Log").String()),
 		statusPath:     strings.TrimSpace(s.Key("Status").String()),
 	}
@@ -121,6 +129,12 @@ func loadAPRSConfig(s *ini.Section) (aprsConfig, error) {
 	}
 	if c.rateLimit < 1 || c.rateBurst < 1 {
 		errs = append(errs, fmt.Errorf("APRS RateLimit and RateBurst must be at least 1"))
+	}
+	if c.can < 0 || c.can > 15 || c.ambiguity < 0 || c.ambiguity > 4 || c.haat < 0 || c.gain < 0 {
+		errs = append(errs, fmt.Errorf("APRS CAN must be 0 to 15, Ambiguity 0 to 4, and HAAT and Gain not negative"))
+	}
+	if len(c.symbol) != 2 {
+		errs = append(errs, fmt.Errorf("APRS Symbol must be a table and a code, such as M&"))
 	}
 	if s.HasKey("Latitude") || s.HasKey("Longitude") {
 		lat, err1 := s.Key("Latitude").Float64()
@@ -147,6 +161,8 @@ type igate struct {
 	m17Call  string
 	m17Enc   *m17.EncodedCallsign
 	duplex   bool // no relay: a duplex gateway repeats every packet already
+	radio    radioInfo
+	link     func() string // the linked reflector, for the beacon
 	queue    *gatedQueue
 	log      *aprsLog // nil unless Log is set
 	now      func() time.Time
@@ -249,6 +265,14 @@ func (a *igate) reconfigure(c aprsConfig) {
 	case a.reconf <- struct{}{}:
 	default:
 	}
+}
+
+// linkInfo names the reflector and module the gateway links to, if any.
+func (a *igate) linkInfo() string {
+	if a.link == nil {
+		return ""
+	}
+	return a.link()
 }
 
 // minTxGap returns the gap before a packet from APRS-IS.
@@ -794,13 +818,11 @@ func (a *igate) beacon() {
 	}
 	a.lastBeacon = a.now()
 	a.mu.Unlock()
-	pos, err := fap.EncodePosition(c.latitude, c.longitude, nil, nil, nil, c.symbol,
-		&fap.EncodePositionOpts{Comment: c.comment})
+	line, err := beaconLine(c, a.radio, a.linkInfo())
 	if err != nil {
 		log.Printf("[ERROR] APRS: beacon: %v", err)
 		return
 	}
-	line := c.callsign + ">" + aprsToCall + ",TCPIP*:" + pos
 	log.Printf("[DEBUG] APRS: beacon %s", line)
 	a.send(line)
 	a.mu.Lock()

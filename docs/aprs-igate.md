@@ -71,9 +71,32 @@ The library's `LSF.CAN()` and `NewLSF(…, can)` handle only bits 8–10. That i
 
 ### 5. The gateway's own beacon
 
-**Chosen:** beacon to APRS-IS only, never RF. It goes out every 30 minutes (`BeaconInterval`), only when `Latitude`/`Longitude` are set and the login is verified. The symbol is `I&` (iGate).
+**Chosen:** beacon to APRS-IS only, never RF. It goes out every 30 minutes (`BeaconInterval`), from the login call with only `TCPIP*` as the path, and only when `Latitude`/`Longitude` are set and the login is verified.
 
-This puts the gate on aprs.fi and gives the `qAR,<gate>` path a location, at no airtime cost. M17 users know the hotspot already. Dire Wolf's `IBEACON` goes to RF by default, with `SENDTO=IG` for APRS-IS.
+It is a position report that says how to reach the hotspot, in the APRS frequency format (aprs.org/info/freqspec.txt):
+
+```
+K0RET-10>APZ001,TCPIP*:!3508.37NM09001.05W&PHG0330/441.112MHz M17 CAN0 M17-KCW B M17 hotspot
+```
+
+The comment is built in this order:
+1. **PHG**, if `HAAT` is set: power from `[Radio] Power` (10 dBm is honestly 0 W), height from `HAAT` in metres, gain from `Gain` in dBi.
+2. **The frequency**, from `TXFrequency`, in the first ten bytes as the format requires. It is given in whole kHz, so 441.1125 shows as 441.112.
+3. **The split** in 10 kHz units, when the receive frequency differs, as on a duplex repeater.
+4. **"M17"**, placed where D-STAR beacons put their mode.
+5. **`CAN`**, the linked reflector, and `Comment`. No standard covers these.
+
+**Symbol:** `M&`, an M overlay on the gateway symbol. APRS defines no M17 symbol, and g4klx's gateways use an equally undefined `D&`.
+
+**Privacy:** `Ambiguity` 1–4 blurs the position, for a hotspot at someone's home.
+
+**Why:** it puts the hotspot on aprs.fi, gives the `qAR,<gate>` path a location, and gives `near` rules a centre, all at no airtime cost.
+
+**Alternatives:**
+- *g4klx's M17Gateway sends `MMDVM Voice (M17) 439.47500MHz -9.0000MHz`.* Its frequency isn't where radios that QSY from beacons look, and its split isn't in the standard form.
+- *openSPOT sends no frequency at all.*
+- *A frequency object* (`;441.112M*…`), as the frequency spec suggests. Those are meant for local RF, and their name holds only the frequency.
+- *Dire Wolf's `IBEACON`* goes to RF by default, with `SENDTO=IG` for APRS-IS.
 
 The gate's own packets use TOCALL `APZ001` (experimental, as `m17-bridge` does). `m17-gateway` should register one with aprsorg/aprs-deviceid.
 

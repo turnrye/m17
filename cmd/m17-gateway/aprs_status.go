@@ -41,6 +41,7 @@ type aprsStatus struct {
 	Counts        map[string]int `json:"counts"`
 	Beacon        string         `json:"beacon,omitempty"`
 	LastBeacon    string         `json:"lastBeacon,omitempty"`
+	BeaconPreview string         `json:"beaconPreview,omitempty"`
 }
 
 // heardStatus is a station heard on RF.
@@ -103,6 +104,9 @@ func (a *igate) status(now time.Time) aprsStatus {
 	}
 	if s.Connected {
 		s.ConnectedAt = stamp(a.connectedAt)
+	}
+	if line, err := beaconLine(c, a.radio, a.linkInfo()); err == nil {
+		s.BeaconPreview = line
 	}
 	for _, call := range slices.Sorted(maps.Keys(a.heard)) {
 		h := a.heard[call]

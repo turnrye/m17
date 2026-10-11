@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -405,6 +406,11 @@ func NewGateway(cfg config, modem modem.Modem) (*Gateway, error) {
 		}
 		g.aprs = newIgate(cfg.aprs, cfg.callsign)
 		g.aprs.duplex = cfg.duplex
+		g.aprs.radio = radioInfo{cfg.rxFrequency, cfg.txFrequency, cfg.power}
+		if cfg.defaultReflector != "" {
+			link := cfg.defaultReflector + " " + cfg.defaultModule
+			g.aprs.link = func() string { return strings.TrimSpace(link) }
+		}
 		if cfg.aprs.logPath != "" {
 			g.aprs.log, err = openAPRSLog(cfg.aprs.logPath)
 			if err != nil {
