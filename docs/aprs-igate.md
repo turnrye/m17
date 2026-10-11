@@ -223,6 +223,21 @@ IS→RF packets wait in their own queue, ordered acks > messages > other. A sche
 
 The last check is repeated just before transmitting, in case a reflector packet went in the meantime. The next packet is timed from the end of the last one, so a burst always leaves a `MinTxGap` gap a local station can key up in.
 
+**When more arrives than the channel can carry**, traffic for nobody in particular is what gives way. That is the `other` class: what watch rules bring, and courtesy positions.
+
+- **Last in line:** it goes only when no ack or message is waiting.
+- **One token in reserve:** it may only spend the rate budget while one token is left for an ack or message. A burst of it therefore never makes a message wait for the bucket to refill.
+- **Shorter expiry:** it expires after 30 s, against 60 s (`MaxQueueAge`) for acks and messages.
+- **Newest wins:** a newer position, status, weather report, telemetry, object or item from the same station replaces the one still waiting, so a backlog clears itself.
+- **Full lanes:** a full class drops its oldest packet.
+
+**Seeing it:**
+- **Traffic log:** every drop appears there.
+- **Status file:**
+  - each watch rule's last 15 minutes: matched, sent, dropped, and skipped (a local station's, or one AX.25 can't carry);
+  - totals for the same window: sent, dropped, dropped acks and messages, and replaced.
+- **Dashboard warning:** the APRS page warns when anything was dropped, and names the rule responsible, so the operator can narrow it or switch it to dashboard-only. The gate doesn't change the rule itself.
+
 **On a duplex repeater** (SX1255, or MMDVM with `Duplex = true`), the same rules hold: a packet never starts while RF is being received. A user who keys up during a gated packet is heard, since the repeater receives while it transmits. Their repeat then races the packet for the modem, as reflector packets already do. A shorter `MinTxGap` can suit a duplex repeater.
 
 ## Traffic log

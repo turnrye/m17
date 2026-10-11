@@ -227,30 +227,33 @@ const (
 	watchRF                           // transmit it
 )
 
-// watchActionFor decides what the rules in force at now say about t. Any
-// rule that transmits wins over one that only logs. Traffic that only the
-// raw Filter can have selected is logged. Must be called with a.mu held.
-func (a *igate) watchActionFor(t tnc2, now time.Time) watchAction {
+// watchActionFor decides what the rules in force at now say about t, and
+// names the rule that decided. Any rule that transmits wins over one that
+// only logs. Traffic that only the raw Filter can have selected is logged.
+// Must be called with a.mu held.
+func (a *igate) watchActionFor(t tnc2, now time.Time) (watchAction, string) {
 	var pos *[2]float64
 	if p, ok := packetPosition(t); ok {
 		pos = &p
 	} else if p, ok := a.lastPosition[strings.ToUpper(t.src)]; ok {
 		pos = &p.p
 	}
-	action := watchNone
+	action, rule := watchNone, ""
 	for _, w := range a.cfg.watches {
 		if !w.active(now) || !w.matches(t, a.cfg, pos) {
 			continue
 		}
 		if w.toRF {
-			return watchRF
+			return watchRF, w.String()
 		}
-		action = watchDashboard
+		if action == watchNone {
+			action, rule = watchDashboard, w.String()
+		}
 	}
 	if action == watchNone && a.cfg.filter != "" {
-		action = watchDashboard
+		action, rule = watchDashboard, "Filter"
 	}
-	return action
+	return action, rule
 }
 
 // packetPosition returns the position t carries, if any.

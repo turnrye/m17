@@ -39,6 +39,7 @@ type aprsStatus struct {
 	Watches       []watchStatus  `json:"watches"`
 	Queue         map[string]int `json:"queue"`
 	Counts        map[string]int `json:"counts"`
+	Recent        recentStat     `json:"recent"`
 	Beacon        string         `json:"beacon,omitempty"`
 	LastBeacon    string         `json:"lastBeacon,omitempty"`
 	BeaconPreview string         `json:"beaconPreview,omitempty"`
@@ -54,16 +55,17 @@ type heardStatus struct {
 
 // watchStatus is one of the operator's rules.
 type watchStatus struct {
-	Key    string  `json:"key"`
-	Rule   string  `json:"rule"`
-	Kind   string  `json:"kind"`
-	Call   string  `json:"call,omitempty"`
-	Lat    float64 `json:"lat,omitempty"`
-	Lon    float64 `json:"lon,omitempty"`
-	Km     float64 `json:"km,omitempty"`
-	ToRF   bool    `json:"toRF"`
-	Until  string  `json:"until,omitempty"`
-	Active bool    `json:"active"`
+	Key    string   `json:"key"`
+	Rule   string   `json:"rule"`
+	Kind   string   `json:"kind"`
+	Call   string   `json:"call,omitempty"`
+	Lat    float64  `json:"lat,omitempty"`
+	Lon    float64  `json:"lon,omitempty"`
+	Km     float64  `json:"km,omitempty"`
+	ToRF   bool     `json:"toRF"`
+	Until  string   `json:"until,omitempty"`
+	Active bool     `json:"active"`
+	Recent ruleStat `json:"recent"`
 }
 
 func stamp(t time.Time) string {
@@ -75,6 +77,7 @@ func stamp(t time.Time) string {
 
 // status gathers the gate's status at now.
 func (a *igate) status(now time.Time) aprsStatus {
+	totals, rules, recent := a.stats.snapshot(now)
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	c := a.cfg
@@ -98,7 +101,8 @@ func (a *igate) status(now time.Time) aprsStatus {
 		Heard:         []heardStatus{},
 		Watches:       []watchStatus{},
 		Queue:         a.queue.counts(),
-		Counts:        maps.Clone(a.counts),
+		Counts:        totals,
+		Recent:        recent,
 		Beacon:        a.beaconLine,
 		LastBeacon:    stamp(a.lastBeacon),
 	}
@@ -115,7 +119,7 @@ func (a *igate) status(now time.Time) aprsStatus {
 	}
 	for _, w := range c.watches {
 		ws := watchStatus{Key: w.key, Rule: w.String(), Call: w.call, ToRF: w.toRF,
-			Until: stamp(w.until), Active: w.active(now)}
+			Until: stamp(w.until), Active: w.active(now), Recent: rules[w.String()]}
 		switch w.kind {
 		case watchCall:
 			ws.Kind = "call"

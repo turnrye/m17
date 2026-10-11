@@ -138,3 +138,69 @@ func TestStatusFile(t *testing.T) {
 		t.Errorf("filter %q", s.Filter)
 	}
 }
+
+// TestNewestWins: a newer report from a station replaces the one waiting.
+func TestNewestWins(t *testing.T) {
+	now := time.Now()
+	a := testIgate(t, &now)
+	watching(t, a, "call W1AW rf")
+	a.fromIS("W1AW>APK004,TCPIP*,qAC,T2TEST:!4142.35N/07243.81W-")
+	a.fromIS("W1AW>APK004,TCPIP*,qAC,T2TEST:!4142.40N/07243.90W-")
+	a.fromIS("W1AW>APK004,TCPIP*,qAC,T2TEST:>status one")
+	a.fromIS("W1AW>APK004,TCPIP*,qAC,T2TEST:>status two")
+	q := queuedRF(a, now)
+	if len(q) != 2 || !strings.HasSuffix(q[0].line, "07243.90W-") || !strings.HasSuffix(q[1].line, "status two") {
+		t.Errorf("queued %v", q)
+	}
+	if _, _, recent := a.stats.snapshot(now); recent.Replaced != 2 {
+		t.Errorf("replaced %d, want 2", recent.Replaced)
+	}
+}
+
+func TestLatestKey(t *testing.T) {
+	for line, want := range map[string]string{
+		"W1AW>APK004:!4142.35N/07243.81W-":                  "position W1AW",
+		"W1AW>APK004:`c51l\x1c>/]\"4)}":                     "position W1AW",
+		"W1AW>APK004:>status":                               "status W1AW",
+		"W1AW>APK004:_10090556c220s004g005t077":             "weather W1AW",
+		"W1AW>APK004:T#005,199,000,255,073,123,01101001":    "telemetry W1AW",
+		"W1AW>APK004:;LEADER   *092345z4903.50N/07201.75W>": "object LEADER",
+		"W1AW>APK004:)AID #2!4903.50N/07201.75WA":           "item AID #2",
+		"W1AW>APK004::K0RET-7  :hi{1":                       "W1AW>APK004::K0RET-7  :hi{1",
+	} {
+		if got := latestKey(mustTNC2(t, line)); got != want {
+			t.Errorf("latestKey(%q) = %q, want %q", line, got, want)
+		}
+	}
+}
+
+// TestRuleStats: the status file says what each rule brought lately, and
+// what became of it.
+func TestRuleStats(t *testing.T) {
+	now := time.Now()
+	a := testIgate(t, &now)
+	watching(t, a, "call W1AW rf", "area 41.7 -72.7 20 dashboard")
+	a.fromIS("W1AW>APK004,TCPIP*,qAC,T2TEST:!4142.35N/07243.81W-")
+	a.fromIS("W1AW>APK004,TCPIP*,qAC,T2TEST:>status")
+	a.fromIS("N1ADJ>APK004,TCPIP*,qAC,T2TEST:!4142.00N/07243.00W-") // only the area rule
+	hearRF(t, a, "W1AW", 0, "W1AW>APORT1:>here")
+	a.fromIS("W1AW>APK004,TCPIP*,qAC,T2TEST:>via another gate") // local now
+	p, _ := a.queue.next(now)
+	a.sentRF(p)
+	a.queue.next(now.Add(time.Minute)) // the other one expires
+	s := a.status(now.Add(time.Minute))
+	call, area := s.Watches[0].Recent, s.Watches[1].Recent
+	if call != (ruleStat{Matched: 3, Sent: 1, Dropped: 1, Skipped: 1}) {
+		t.Errorf("call rule %+v", call)
+	}
+	if area != (ruleStat{Matched: 1}) {
+		t.Errorf("area rule %+v", area)
+	}
+	if s.Recent.Sent != 1 || s.Recent.Dropped != 1 || s.Recent.DroppedAddressed != 0 {
+		t.Errorf("recent %+v", s.Recent)
+	}
+	now = now.Add(statWindow + 2*time.Minute)
+	if s := a.status(now); s.Watches[0].Recent != (ruleStat{}) {
+		t.Errorf("old events still counted: %+v", s.Watches[0].Recent)
+	}
+}

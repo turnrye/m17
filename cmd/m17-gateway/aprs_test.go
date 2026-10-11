@@ -355,8 +355,8 @@ func TestRawFilterWatched(t *testing.T) {
 	a := testIgate(t, &now)
 	a.cfg.filter = "m/10"
 	a.fromIS("W1AW>APK004,TCPIP*,qAC,T2TEST:>status")
-	if a.queue.len() != 0 || a.counts["isWatched"] != 1 {
-		t.Errorf("queued %d, watched %d", a.queue.len(), a.counts["isWatched"])
+	if a.queue.len() != 0 || a.stats.get("isWatched") != 1 {
+		t.Errorf("queued %d, watched %d", a.queue.len(), a.stats.get("isWatched"))
 	}
 }
 
@@ -397,8 +397,8 @@ func TestWatchCall(t *testing.T) {
 	if q := queuedRF(a, now); len(q) != 2 || q[1].class != gatedOther {
 		t.Errorf("queued %v", q)
 	}
-	if a.counts["isWatched"] != 1 {
-		t.Errorf("watched %d, want 1", a.counts["isWatched"])
+	if a.stats.get("isWatched") != 1 {
+		t.Errorf("watched %d, want 1", a.stats.get("isWatched"))
 	}
 	now = now.Add(2 * time.Hour)
 	a.expire(now)

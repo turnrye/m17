@@ -28,6 +28,14 @@ func (c gatedClass) String() string {
 // dropped for a new one.
 var gatedClassLimit = [gatedClasses]int{16, 16, 8}
 
+// Traffic for nobody in particular yields to acks and messages: it waits
+// at most otherMaxAge, and is sent only while otherReserve tokens are left
+// for them, so a burst of it never makes a message wait for the bucket.
+const (
+	otherMaxAge  = 30 * time.Second
+	otherReserve = 1.0
+)
+
 // gatedPacket is a packet from APRS-IS, or a relay, waiting to be
 // transmitted.
 type gatedPacket struct {
@@ -40,6 +48,7 @@ type gatedPacket struct {
 	queued    time.Time
 	notBefore time.Time // held until then; zero to send when it can
 	sent      func()    // optional; called once it has been transmitted
+	rule      string    // the watch rule that brought it, if any
 }
 
 // gatedQueue holds APRS-IS packets for RF by class, drops them when they
@@ -163,11 +172,15 @@ func (q *gatedQueue) next(now time.Time) (*gatedPacket, time.Duration) {
 	var at int
 	var held time.Duration
 	for i := range q.classes {
+		maxAge := q.maxAge
+		if gatedClass(i) == gatedOther {
+			maxAge = min(maxAge, otherMaxAge)
+		}
 		c := q.classes[i][:0]
 		for _, e := range q.classes[i] {
-			if now.Sub(e.queued) > q.maxAge {
-				log.Printf("[INFO] APRS: %s waited over %v, dropping %s", e.class, q.maxAge, e.line)
-				q.drop(e, "expired after "+q.maxAge.String())
+			if now.Sub(e.queued) > maxAge {
+				log.Printf("[INFO] APRS: %s waited over %v, dropping %s", e.class, maxAge, e.line)
+				q.drop(e, "expired after "+maxAge.String())
 				continue
 			}
 			c = append(c, e)
@@ -189,8 +202,12 @@ func (q *gatedQueue) next(now time.Time) (*gatedPacket, time.Duration) {
 	if p == nil {
 		return nil, held
 	}
-	if q.tokens < 1 {
-		return nil, time.Duration(math.Ceil((1 - q.tokens) / q.rate * float64(time.Second)))
+	need := 1.0
+	if p.class == gatedOther {
+		need += min(otherReserve, q.burst-1)
+	}
+	if q.tokens < need {
+		return nil, time.Duration(math.Ceil((need - q.tokens) / q.rate * float64(time.Second)))
 	}
 	q.tokens--
 	c := q.classes[p.class]

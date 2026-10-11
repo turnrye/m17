@@ -131,3 +131,46 @@ func TestGatedQueueHold(t *testing.T) {
 		t.Errorf("held packet not sent when due: %+v", p)
 	}
 }
+
+// TestGatedQueueReserve: other traffic leaves a token for acks and
+// messages, so one arriving after a burst of it goes at once.
+func TestGatedQueueReserve(t *testing.T) {
+	now := time.Now()
+	q := newGatedQueue(time.Hour, 6, 3, now)
+	for _, k := range []string{"a", "b", "c"} {
+		q.push(gated(gatedOther, k, now))
+	}
+	for _, want := range []string{"a", "b"} {
+		if p, _ := q.next(now); p == nil || p.key != want {
+			t.Fatalf("next = %+v, want %s", p, want)
+		}
+	}
+	if p, wait := q.next(now); p != nil || wait != 10*time.Second {
+		t.Fatalf("third other = %+v, %v; want it to wait 10s", p, wait)
+	}
+	q.push(gated(gatedMessage, "msg", now))
+	if p, _ := q.next(now); p == nil || p.key != "msg" {
+		t.Errorf("message waited behind other traffic: %+v", p)
+	}
+	// With a burst of one there is nothing to reserve.
+	q = newGatedQueue(time.Hour, 6, 1, now)
+	q.push(gated(gatedOther, "a", now))
+	if p, _ := q.next(now); p == nil {
+		t.Error("other traffic never sent with RateBurst 1")
+	}
+}
+
+// TestGatedQueueOtherAge: other traffic expires sooner than messages.
+func TestGatedQueueOtherAge(t *testing.T) {
+	now := time.Now()
+	q := newGatedQueue(time.Minute, 60, 10, now)
+	q.push(gated(gatedOther, "pos", now))
+	q.push(gated(gatedMessage, "msg", now))
+	later := now.Add(31 * time.Second)
+	if p, _ := q.next(later); p == nil || p.key != "msg" {
+		t.Fatalf("next = %+v, want msg", p)
+	}
+	if q.len() != 0 {
+		t.Error("other traffic outlived otherMaxAge")
+	}
+}

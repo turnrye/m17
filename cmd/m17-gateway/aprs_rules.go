@@ -158,6 +158,33 @@ func isPosition(t tnc2) bool {
 	return err == nil && p.Latitude != nil && p.Type == fap.PacketTypeLocation
 }
 
+// latestKey identifies what t reports on, so that a newer report replaces
+// one still waiting to be sent: a station's position, status, weather or
+// telemetry, or an object or item by name. Anything else is only replaced
+// by an exact copy.
+func latestKey(t tnc2) string {
+	src := strings.ToUpper(t.src)
+	switch c := t.info[0]; {
+	case c == ';' && len(t.info) >= 10:
+		return "object " + strings.TrimRight(t.info[1:10], " ")
+	case c == ')':
+		name := t.info[1:]
+		if i := strings.IndexAny(name, "!_"); i > 0 {
+			name = name[:i]
+		}
+		return "item " + name
+	case strings.ContainsRune("!=/@`'\x1c\x1d$", rune(c)):
+		return "position " + src
+	case c == '>':
+		return "status " + src
+	case c == '_':
+		return "weather " + src
+	case strings.HasPrefix(t.info, "T#"):
+		return "telemetry " + src
+	}
+	return t.key()
+}
+
 // Reasons a packet is not gated, for logs and counters.
 const (
 	dropMalformed   = "malformed"

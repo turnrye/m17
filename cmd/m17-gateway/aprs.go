@@ -180,7 +180,7 @@ type igate struct {
 	relayed      map[string]time.Time // messages relayed, as "SRC>DST{id"
 	lastPosition map[string]posAt     // latest APRS-IS position by source
 	filter       string               // the server filter last asked for
-	counts       map[string]int       // traffic counters, for the status file
+	stats        *aprsStats           // counters, for the status file
 	server       string               // the APRS-IS server, from its keepalives
 	serverLine   string               // its last keepalive
 	serverSeen   time.Time
@@ -209,7 +209,7 @@ func newIgate(cfg aprsConfig, m17Call string) *igate {
 		courtesyLSF:  map[string][2]byte{},
 		relayed:      map[string]time.Time{},
 		lastPosition: map[string]posAt{},
-		counts:       map[string]int{},
+		stats:        newAPRSStats(),
 		out:          make(chan string, 64),
 		done:         make(chan struct{}),
 		reconf:       make(chan struct{}, 1),
@@ -218,7 +218,12 @@ func newIgate(cfg aprsConfig, m17Call string) *igate {
 	// Always there, so that IStoRF or Relay can be turned on while running.
 	a.queue = newGatedQueue(cfg.maxQueueAge, cfg.rateLimit, cfg.rateBurst, time.Now())
 	a.queue.dropped = func(p *gatedPacket, why string) {
-		a.counts["rfDropped"]++
+		kind := "replaced"
+		if !strings.HasPrefix(why, "replaced") {
+			kind = "dropped"
+			a.stats.add("rfDropped")
+		}
+		a.stats.event(a.now(), kind, p.rule, p.class)
 		a.log.write(a.now(), aprsEvent{Dir: aprsToRF, Line: p.line, Result: why, Class: p.class.String()})
 	}
 	a.filter = a.buildFilter()
@@ -282,11 +287,10 @@ func (a *igate) minTxGap() time.Duration {
 	return a.cfg.minTxGap
 }
 
-// count adds one to a traffic counter.
-func (a *igate) count(name string) {
-	a.mu.Lock()
-	a.counts[name]++
-	a.mu.Unlock()
+// sentRF notes a packet transmitted on RF.
+func (a *igate) sentRF(p *gatedPacket) {
+	a.stats.add("rfSent")
+	a.stats.event(a.now(), "sent", p.rule, p.class)
 }
 
 // start connects to APRS-IS and keeps the gate's state current.
@@ -329,7 +333,7 @@ func (a *igate) fromRF(lsf *m17.LSF, payload []byte) {
 		return
 	}
 	a.mu.Lock()
-	a.counts["rfHeard"]++
+	a.stats.add("rfHeard")
 	// A packet another gate brought from APRS-IS, or a gateway relayed
 	// (marked by Extended Callsign Data), is on the air, but its source is
 	// not a station heard here.
@@ -366,9 +370,9 @@ func (a *igate) fromRF(lsf *m17.LSF, payload []byte) {
 	verified := a.verified
 	switch {
 	case reason != "":
-		a.counts["rfNotGated"]++
+		a.stats.add("rfNotGated")
 	case verified:
-		a.counts["rfGated"]++
+		a.stats.add("rfGated")
 	}
 	a.mu.Unlock()
 	ev := aprsEvent{Dir: aprsFromRF, M17: m17Src, Line: line, Out: out}
@@ -431,7 +435,7 @@ func (a *igate) relayLocked(lsf *m17.LSF, t tnc2, now time.Time) {
 	p.packet = m17.Packet{LSF: &l, Type: m17.PacketTypeAPRS, Payload: append([]byte(p.line), 0)}
 	p.packet.CalcCRC()
 	a.queue.push(p)
-	a.counts["relayQueued"]++
+	a.stats.add("relayQueued")
 	a.log.write(now, aprsEvent{Dir: aprsFromRF, M17: lsf.Src.Callsign(), Line: t.String(),
 		Result: "relay queued (" + p.class.String() + ")"})
 }
@@ -447,27 +451,27 @@ func (a *igate) fromIS(line string) {
 	}
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	a.counts["isReceived"]++
+	a.stats.add("isReceived")
 	if pos, ok := packetPosition(t); ok {
 		a.lastPosition[strings.ToUpper(t.src)] = posAt{pos, now}
 	}
 	p, reason := a.selectForRF(t, now)
 	switch {
 	case reason == dropWatched:
-		a.counts["isWatched"]++
+		a.stats.add("isWatched")
 		a.log.write(now, aprsEvent{Dir: aprsFromIS, Line: line, Result: "watched"})
 		return
 	case reason != "":
-		a.counts["isNotSent"]++
+		a.stats.add("isNotSent")
 		log.Printf("[DEBUG] APRS: not gating to RF (%s): %s", reason, line)
 		a.log.write(now, aprsEvent{Dir: aprsFromIS, Line: line, Result: "not sent: " + reason})
 		return
 	case !a.cfg.isToRF:
-		a.counts["isWatched"]++
+		a.stats.add("isWatched")
 		a.log.write(now, aprsEvent{Dir: aprsFromIS, Line: line, Result: "watched (IStoRF off)"})
 		return
 	}
-	a.counts["isQueued"]++
+	a.stats.add("isQueued")
 	a.log.write(now, aprsEvent{Dir: aprsFromIS, Line: line, Result: "queued " + p.class.String()})
 	a.queue.push(p)
 	switch {
@@ -506,9 +510,11 @@ func (a *igate) selectForRF(t tnc2, now time.Time) (*gatedPacket, string) {
 		if st == nil || now.Sub(st.last) > a.cfg.heardWindow {
 			// Not for a station here: only the operator's rules want it,
 			// and then as any other traffic they bring.
-			if r := a.watchedLocked(t, now); r != "" {
+			r, rule := a.watchedLocked(t, now)
+			if r != "" {
 				return nil, r
 			}
+			p.rule = rule
 			break
 		}
 		if s := a.heard[src]; s != nil && now.Sub(s.last) < localSenderWindow {
@@ -533,12 +539,21 @@ func (a *igate) selectForRF(t tnc2, now time.Time) (*gatedPacket, string) {
 		if isPos {
 			a.positions[src], a.positionTime[src] = t.String(), now
 		}
-		if r := a.watchedLocked(t, now); r != "" {
+		r, rule := a.watchedLocked(t, now)
+		if r != "" {
 			return nil, r
 		}
+		p.rule = rule
+	}
+	if p.class == gatedOther && !isMsg {
+		// A newer report replaces one still waiting.
+		p.key = latestKey(t)
 	}
 	line, reason := isToRFLine(t, a.cfg.callsign, aprsToCall, a.cfg.wrap)
 	if reason != "" {
+		if p.rule != "" {
+			a.stats.event(now, "skipped", p.rule, p.class)
+		}
 		return nil, reason
 	}
 	pkt, err := a.rfPacket(line, lsfType)
@@ -551,20 +566,25 @@ func (a *igate) selectForRF(t tnc2, now time.Time) (*gatedPacket, string) {
 }
 
 // watchedLocked applies the operator's rules to traffic the iGate rules
-// don't transmit: "" to transmit it, or the reason not to. Must be called
-// with a.mu held.
-func (a *igate) watchedLocked(t tnc2, now time.Time) string {
-	switch a.watchActionFor(t, now) {
+// don't transmit: "" to transmit it, or the reason not to, and the rule
+// that matched. Must be called with a.mu held.
+func (a *igate) watchedLocked(t tnc2, now time.Time) (string, string) {
+	action, rule := a.watchActionFor(t, now)
+	if action != watchNone {
+		a.stats.event(now, "matched", rule, gatedOther)
+	}
+	switch action {
 	case watchRF:
 		// A local station's packets are on the air already.
 		if s := a.heard[strings.ToUpper(t.src)]; s != nil && now.Sub(s.last) < a.cfg.heardWindow {
-			return dropSenderLocal
+			a.stats.event(now, "skipped", rule, gatedOther)
+			return dropSenderLocal, rule
 		}
-		return ""
+		return "", rule
 	case watchDashboard:
-		return dropWatched
+		return dropWatched, rule
 	}
-	return dropNotForRF
+	return dropNotForRF, ""
 }
 
 // rfPacket builds the M17 packet for line, broadcast from the gateway, on
@@ -592,7 +612,7 @@ func (a *igate) courtesyFor(src string, lsfType [2]byte, now time.Time) {
 		t, _ := parseTNC2(line)
 		rf, reason := isToRFLine(t, a.cfg.callsign, aprsToCall, a.cfg.wrap)
 		if pkt, err := a.rfPacket(rf, lsfType); reason == "" && err == nil {
-			a.queue.push(&gatedPacket{class: gatedOther, key: t.key(), from: src, line: rf, packet: *pkt, queued: now})
+			a.queue.push(&gatedPacket{class: gatedOther, key: latestKey(t), from: src, line: rf, packet: *pkt, queued: now})
 			a.courtesySent[src] = now
 			return
 		}
@@ -827,7 +847,7 @@ func (a *igate) beacon() {
 	a.send(line)
 	a.mu.Lock()
 	a.beaconLine = line
-	a.counts["beacons"]++
+	a.stats.add("beacons")
 	a.mu.Unlock()
 	a.log.write(a.now(), aprsEvent{Dir: aprsToIS, Line: line, Result: "beacon"})
 }

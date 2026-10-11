@@ -188,7 +188,7 @@ func (g *Gateway) transmitGated(p *gatedPacket, gap time.Duration) {
 			if err != nil {
 				result = "error: " + err.Error()
 			}
-			g.aprs.count("rfSent")
+			g.aprs.sentRF(p)
 			g.aprs.log.write(time.Now(), aprsEvent{Dir: aprsToRF, Line: p.line, Result: result, Class: p.class.String()})
 		}
 		return err
