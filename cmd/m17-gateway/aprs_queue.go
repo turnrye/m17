@@ -51,6 +51,7 @@ type gatedQueue struct {
 	tokens   float64
 	lastFill time.Time
 	wake     chan struct{}
+	dropped  func(p *gatedPacket, why string) // optional; called with mu held
 }
 
 func newGatedQueue(maxAge time.Duration, perMinute, burst int, now time.Time) *gatedQueue {
@@ -72,12 +73,14 @@ func (q *gatedQueue) push(p *gatedPacket) {
 	for i, old := range c {
 		if old.key == p.key {
 			log.Printf("[DEBUG] APRS: replacing queued %s %s", p.class, old.line)
+			q.drop(old, "replaced by a newer copy")
 			c = append(c[:i], c[i+1:]...)
 			break
 		}
 	}
 	if len(c) >= gatedClassLimit[p.class] {
 		log.Printf("[INFO] APRS: %s queue full, dropping %s", p.class, c[0].line)
+		q.drop(c[0], "dropped: queue full")
 		c = c[1:]
 	}
 	q.classes[p.class] = append(c, p)
@@ -96,11 +99,20 @@ func (q *gatedQueue) cancel(from, to, id string) {
 	for _, p := range q.classes[gatedMessage] {
 		if sameStation(p.from, from) && sameStation(p.msg.addressee, to) && p.msg.id == id {
 			log.Printf("[DEBUG] APRS: %s acked on RF, dropping queued %s", to, p.line)
+			q.drop(p, "dropped: acked on RF")
 			continue
 		}
 		c = append(c, p)
 	}
 	q.classes[gatedMessage] = c
+}
+
+// drop reports a packet leaving the queue unsent. Must be called with
+// q.mu held.
+func (q *gatedQueue) drop(p *gatedPacket, why string) {
+	if q.dropped != nil {
+		q.dropped(p, why)
+	}
 }
 
 // len reports how many packets are queued.
@@ -127,6 +139,7 @@ func (q *gatedQueue) next(now time.Time) (*gatedPacket, time.Duration) {
 		c := q.classes[i]
 		for len(c) > 0 && now.Sub(c[0].queued) > q.maxAge {
 			log.Printf("[INFO] APRS: %s waited over %v, dropping %s", c[0].class, q.maxAge, c[0].line)
+			q.drop(c[0], "expired after "+q.maxAge.String())
 			c = c[1:]
 		}
 		q.classes[i] = c

@@ -66,6 +66,7 @@ type aprsConfig struct {
 	longitude      float64
 	symbol         string
 	comment        string
+	logPath        string
 }
 
 func loadAPRSConfig(s *ini.Section) (aprsConfig, error) {
@@ -87,6 +88,7 @@ func loadAPRSConfig(s *ini.Section) (aprsConfig, error) {
 		beaconInterval: s.Key("BeaconInterval").MustDuration(30 * time.Minute),
 		symbol:         s.Key("Symbol").MustString("I&"),
 		comment:        s.Key("Comment").String(),
+		logPath:        strings.TrimSpace(s.Key("Log").String()),
 	}
 	if !c.enabled {
 		return c, nil
@@ -128,6 +130,7 @@ type igate struct {
 	verified bool // the passcode matches, so APRS-IS takes what is sent
 	m17Call  string
 	queue    *gatedQueue // nil unless IS to RF is on
+	log      *aprsLog    // nil unless Log is set
 	now      func() time.Time
 
 	mu           sync.Mutex
@@ -165,6 +168,9 @@ func newIgate(cfg aprsConfig, m17Call string) *igate {
 	}
 	if cfg.isToRF {
 		a.queue = newGatedQueue(cfg.maxQueueAge, cfg.rateLimit, cfg.rateBurst, time.Now())
+		a.queue.dropped = func(p *gatedPacket, why string) {
+			a.log.write(a.now(), aprsEvent{Dir: aprsToRF, Line: p.line, Result: why, Class: p.class.String()})
+		}
 	}
 	a.filter = a.buildFilter()
 	return a
@@ -185,6 +191,7 @@ func (a *igate) close() {
 			a.conn.Close()
 		}
 		a.mu.Unlock()
+		a.log.close()
 	})
 }
 
@@ -200,12 +207,14 @@ func (a *igate) qConstruct() string {
 // on the decoder.
 func (a *igate) fromRF(lsf *m17.LSF, payload []byte) {
 	line, _, _ := strings.Cut(string(payload), "\x00")
+	m17Src := lsf.Src.Callsign()
+	now := a.now()
 	t, err := parseTNC2(line)
 	if err != nil {
-		log.Printf("[DEBUG] APRS: bad line from %s on RF: %v", lsf.Src.Callsign(), err)
+		log.Printf("[DEBUG] APRS: bad line from %s on RF: %v", m17Src, err)
+		a.log.write(now, aprsEvent{Dir: aprsFromRF, M17: m17Src, Line: line, Result: "bad line"})
 		return
 	}
-	now := a.now()
 	a.mu.Lock()
 	// A packet another gate brought from APRS-IS, or a gateway relayed
 	// (marked by Extended Callsign Data), is on the air, but its source is
@@ -225,6 +234,7 @@ func (a *igate) fromRF(lsf *m17.LSF, payload []byte) {
 	}
 	if !a.cfg.rfToIS {
 		a.mu.Unlock()
+		a.log.write(now, aprsEvent{Dir: aprsFromRF, M17: m17Src, Line: line, Result: "heard (RFtoIS off)"})
 		return
 	}
 	out, reason := rfToIS(t, a.cfg.callsign, a.qConstruct())
@@ -237,35 +247,43 @@ func (a *igate) fromRF(lsf *m17.LSF, payload []byte) {
 		}
 	}
 	a.mu.Unlock()
+	ev := aprsEvent{Dir: aprsFromRF, M17: m17Src, Line: line, Out: out}
 	switch {
 	case reason != "":
 		log.Printf("[DEBUG] APRS: not gating to APRS-IS (%s): %s", reason, line)
+		ev.Result = "not gated: " + reason
 	case !a.verified:
 		log.Printf("[INFO] APRS: would gate to APRS-IS (receive-only login): %s", out)
+		ev.Result = "would gate (receive only)"
 	default:
 		log.Printf("[INFO] APRS: RF to APRS-IS: %s", out)
 		a.send(out)
+		ev.Result = "gated"
 	}
+	a.log.write(now, ev)
 }
 
 // fromIS takes a packet from APRS-IS.
 func (a *igate) fromIS(line string) {
-	t, err := parseTNC2(line)
-	if err != nil {
-		log.Printf("[DEBUG] APRS: bad line from APRS-IS: %v", err)
-		return
-	}
 	if a.queue == nil {
 		return
 	}
 	now := a.now()
+	t, err := parseTNC2(line)
+	if err != nil {
+		log.Printf("[DEBUG] APRS: bad line from APRS-IS: %v", err)
+		a.log.write(now, aprsEvent{Dir: aprsFromIS, Line: line, Result: "bad line"})
+		return
+	}
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	p, reason := a.selectForRF(t, now)
 	if reason != "" {
 		log.Printf("[DEBUG] APRS: not gating to RF (%s): %s", reason, line)
+		a.log.write(now, aprsEvent{Dir: aprsFromIS, Line: line, Result: "not sent: " + reason})
 		return
 	}
+	a.log.write(now, aprsEvent{Dir: aprsFromIS, Line: line, Result: "queued " + p.class.String()})
 	a.queue.push(p)
 	switch {
 	case p.class == gatedMessage && a.cfg.courtesy:
@@ -562,4 +580,5 @@ func (a *igate) beacon() {
 	line := a.cfg.callsign + ">" + aprsToCall + ",TCPIP*:" + pos
 	log.Printf("[DEBUG] APRS: beacon %s", line)
 	a.send(line)
+	a.log.write(a.now(), aprsEvent{Dir: aprsToIS, Line: line, Result: "beacon"})
 }

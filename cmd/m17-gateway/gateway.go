@@ -398,6 +398,12 @@ func NewGateway(cfg config, modem modem.Modem) (*Gateway, error) {
 	go g.sendPackets()
 	if cfg.aprs.enabled {
 		g.aprs = newIgate(cfg.aprs, cfg.callsign)
+		if cfg.aprs.logPath != "" {
+			g.aprs.log, err = openAPRSLog(cfg.aprs.logPath)
+			if err != nil {
+				return nil, fmt.Errorf("opening APRS Log: %w", err)
+			}
+		}
 		if g.aprs.queue != nil {
 			go g.sendGated(g.aprs.queue, cfg.aprs.minTxGap, g.aprs.done)
 		}

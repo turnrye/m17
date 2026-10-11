@@ -151,6 +151,30 @@ The last check is repeated just before transmitting, in case a reflector packet 
 
 **On a duplex repeater** (SX1255, or MMDVM with `Duplex = true`), the same rules hold: a packet never starts while RF is being received. A user who keys up during a gated packet is heard, since the repeater receives while it transmits. Their repeat then races the packet for the modem, as reflector packets already do. A shorter `MinTxGap` can suit a duplex repeater.
 
+## Traffic log
+
+With `Log` set, the gate writes one JSON object per line to its own file:
+
+- every APRS line heard on RF or received from APRS-IS, with what it did with it;
+- every packet it transmitted, or dropped from the queue unsent;
+- its beacon.
+
+The file is rotated at 4 MB, keeping one old file. It is kept apart from `dashboard.log` because the dashboard's last-heard reads only that file's last 100 lines, so busy APRS-IS traffic would push voice out of them. rpi-dashboard shows it on an APRS page.
+
+| Field | Meaning |
+|---|---|
+| `time` | RFC 3339 timestamp |
+| `dir` | `RF` (heard), `APRS-IS` (received), `RF TX` (transmitted or dropped from the queue), `APRS-IS TX` (the gate's beacon) |
+| `m17` | for `RF`, the M17 source it was heard from |
+| `line` | the TNC2 line as heard, received, or transmitted |
+| `result` | `gated`, `would gate (receive only)`, `not gated: <reason>`, `queued <class>`, `not sent: <reason>`, `sent after <wait>`, `expired after <age>`, `dropped: queue full`, `dropped: acked on RF`, `replaced by a newer copy`, `beacon` |
+| `out` | for `RF`, the line as gated to APRS-IS |
+| `class` | for `RF TX`: `ack`, `message` or `other` |
+
+```json
+{"time":"2026-10-11T08:27:16.32-05:00","dir":"RF","m17":"K0RET","line":"K0RET-7>APORT1:>here","result":"gated","out":"K0RET-7>APORT1,qAR,K0RET-10:>here"}
+```
+
 ## Not done
 
 - **Rule 4 of aprs-is.net** ("the receiving station has not been heard via the Internet") is not done; Dire Wolf doesn't do it either.

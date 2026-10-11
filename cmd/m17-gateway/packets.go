@@ -174,9 +174,17 @@ func (g *Gateway) transmitGated(p *gatedPacket, gap time.Duration) {
 		for wait := g.gatedWait(time.Now(), gap); wait > 0; wait = g.gatedWait(time.Now(), gap) {
 			time.Sleep(min(wait, channelPoll))
 		}
-		log.Printf("[INFO] APRS-IS to RF (%s, queued %v): %s", p.class, time.Since(p.queued).Round(time.Millisecond), p.line)
+		waited := time.Since(p.queued).Round(time.Millisecond)
+		log.Printf("[INFO] APRS-IS to RF (%s, queued %v): %s", p.class, waited, p.line)
 		err := g.modem.TransmitPacket(p.packet)
 		g.packetSent()
+		if g.aprs != nil {
+			result := "sent after " + waited.String()
+			if err != nil {
+				result = "error: " + err.Error()
+			}
+			g.aprs.log.write(time.Now(), aprsEvent{Dir: aprsToRF, Line: p.line, Result: result, Class: p.class.String()})
+		}
 		return err
 	}
 	if g.tryEnqueue(send, p.packet) {

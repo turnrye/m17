@@ -61,6 +61,10 @@ RateLimit=6
 RateBurst=3
 ; After a message, send its sender's position, once per 30 minutes.
 CourtesyPosition=true
+; Every APRS line heard on RF or received from APRS-IS, what was done with it,
+; and what was sent, as JSON lines for the dashboard's APRS page. Rotated at
+; 4 MB. Leave empty for none.
+Log=/opt/m17/m17-gateway/aprs.log
 ; Send packets whose addresses AX.25 can't hold (WINLINK, KD7ZYN-S) in
 ; third-party form, for radios that unwrap it, rather than skipping them.
 ThirdParty=false
