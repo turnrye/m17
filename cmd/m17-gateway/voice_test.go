@@ -51,6 +51,36 @@ func TestNetVoiceWaitsForRF(t *testing.T) {
 	}
 }
 
+// TestNetVoiceWaitsForSpeaking: reflector voice is held back while the
+// gateway speaks, and joined, with a fresh LSF, once it has finished.
+func TestNetVoiceWaitsForSpeaking(t *testing.T) {
+	g, m := testGateway(t, 10*time.Millisecond, 10*time.Millisecond)
+	g.link.Store(&inet.Client{})
+	lsf, err := m17.NewLSF("@ALL", "W7GKB D", m17.LSFTypeStream, m17.LSFDataTypeVoice, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	send := func(fn uint16) {
+		sd := m17.NewStreamDatagram(0x6425, fn, &lsf, make([]byte, 16))
+		if err := g.TransmitVoiceStream(sd); err != nil {
+			t.Fatal(err)
+		}
+	}
+	g.speaking.Store(true)
+	for fn := range uint16(5) {
+		send(fn)
+	}
+	if got := m.voiceFrames(); len(got) > 0 {
+		t.Fatalf("frames %v transmitted while the gateway spoke", got)
+	}
+	g.speaking.Store(false)
+	send(5)
+	send(6 | 0x8000)
+	if got, want := m.voiceFrames(), []uint16{5, 6 | 0x8000}; !slices.Equal(got, want) {
+		t.Errorf("transmitted frames %v, want %v", got, want)
+	}
+}
+
 // TestNetVoiceAfterRFStreamEnd: once a local stream has ended, reflector
 // voice waits only rfTurnaround, not the full rxHoldoff.
 func TestNetVoiceAfterRFStreamEnd(t *testing.T) {
