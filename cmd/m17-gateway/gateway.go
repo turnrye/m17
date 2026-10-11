@@ -397,6 +397,10 @@ func NewGateway(cfg config, modem modem.Modem) (*Gateway, error) {
 	}
 	go g.sendPackets()
 	if cfg.aprs.enabled {
+		if cfg.aprs.relay && cfg.duplex {
+			log.Printf("[INFO] APRS: not relaying: a duplex gateway repeats every packet already")
+			cfg.aprs.relay = false
+		}
 		g.aprs = newIgate(cfg.aprs, cfg.callsign)
 		if cfg.aprs.logPath != "" {
 			g.aprs.log, err = openAPRSLog(cfg.aprs.logPath)

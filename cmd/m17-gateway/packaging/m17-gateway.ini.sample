@@ -65,6 +65,12 @@ CourtesyPosition=true
 ; and what was sent, as JSON lines for the dashboard's APRS page. Rotated at
 ; 4 MB. Leave empty for none.
 Log=/opt/m17/m17-gateway/aprs.log
+; Simplex only: relay APRS messages between two stations both heard on RF,
+; which may not hear each other. A message waits RelayHold, and isn't relayed
+; if its addressee acks it first; an ack is relayed only for a message that
+; was. Positions are never relayed. Duplex gateways repeat everything anyway.
+Relay=false
+RelayHold=5s
 ; Send packets whose addresses AX.25 can't hold (WINLINK, KD7ZYN-S) in
 ; third-party form, for radios that unwrap it, rather than skipping them.
 ThirdParty=false

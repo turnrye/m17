@@ -42,6 +42,9 @@ const (
 	localSenderWindow = time.Minute
 	// courtesyInterval is how often a sender's courtesy position may go.
 	courtesyInterval = 30 * time.Minute
+	// relayAckWindow is how long after relaying a message its ack is
+	// relayed back.
+	relayAckWindow = 5 * time.Minute
 )
 
 // aprsConfig is the [APRS] section of the configuration.
@@ -60,6 +63,8 @@ type aprsConfig struct {
 	rateBurst      int
 	courtesy       bool
 	wrap           bool
+	relay          bool
+	relayHold      time.Duration
 	beaconInterval time.Duration
 	hasPosition    bool
 	latitude       float64
@@ -85,6 +90,8 @@ func loadAPRSConfig(s *ini.Section) (aprsConfig, error) {
 		rateBurst:      s.Key("RateBurst").MustInt(3),
 		courtesy:       s.Key("CourtesyPosition").MustBool(true),
 		wrap:           s.Key("ThirdParty").MustBool(false),
+		relay:          s.Key("Relay").MustBool(false),
+		relayHold:      s.Key("RelayHold").MustDuration(5 * time.Second),
 		beaconInterval: s.Key("BeaconInterval").MustDuration(30 * time.Minute),
 		symbol:         s.Key("Symbol").MustString("I&"),
 		comment:        s.Key("Comment").String(),
@@ -129,7 +136,8 @@ type igate struct {
 	cfg      aprsConfig
 	verified bool // the passcode matches, so APRS-IS takes what is sent
 	m17Call  string
-	queue    *gatedQueue // nil unless IS to RF is on
+	m17Enc   *m17.EncodedCallsign
+	queue    *gatedQueue // nil unless IS to RF or the relay is on
 	log      *aprsLog    // nil unless Log is set
 	now      func() time.Time
 
@@ -142,7 +150,8 @@ type igate struct {
 	courtesyDue  map[string]time.Time // senders whose next position goes to RF
 	courtesySent map[string]time.Time
 	courtesyLSF  map[string][2]byte
-	filter       string // the server filter last asked for
+	relayed      map[string]time.Time // messages relayed, as "SRC>DST{id"
+	filter       string               // the server filter last asked for
 	conn         *fap.Conn
 	out          chan string
 	done         chan struct{}
@@ -163,10 +172,12 @@ func newIgate(cfg aprsConfig, m17Call string) *igate {
 		courtesyDue:  map[string]time.Time{},
 		courtesySent: map[string]time.Time{},
 		courtesyLSF:  map[string][2]byte{},
+		relayed:      map[string]time.Time{},
 		out:          make(chan string, 64),
 		done:         make(chan struct{}),
 	}
-	if cfg.isToRF {
+	a.m17Enc, _ = m17.EncodeCallsign(m17Call)
+	if cfg.isToRF || cfg.relay {
 		a.queue = newGatedQueue(cfg.maxQueueAge, cfg.rateLimit, cfg.rateBurst, time.Now())
 		a.queue.dropped = func(p *gatedPacket, why string) {
 			a.log.write(a.now(), aprsEvent{Dir: aprsToRF, Line: p.line, Result: why, Class: p.class.String()})
@@ -232,6 +243,9 @@ func (a *igate) fromRF(lsf *m17.LSF, payload []byte) {
 	if m, ok := parseMessage(t); ok && m.ack && a.queue != nil {
 		a.queue.cancel(m.addressee, t.src, m.id)
 	}
+	if a.cfg.relay {
+		a.relayLocked(lsf, t, now)
+	}
 	if !a.cfg.rfToIS {
 		a.mu.Unlock()
 		a.log.write(now, aprsEvent{Dir: aprsFromRF, M17: m17Src, Line: line, Result: "heard (RFtoIS off)"})
@@ -263,9 +277,57 @@ func (a *igate) fromRF(lsf *m17.LSF, payload []byte) {
 	a.log.write(now, ev)
 }
 
+// relayLocked queues a message heard on RF for another station heard
+// here, so that two stations of a simplex hotspot that can't hear each
+// other can still exchange messages. A message is held for relayHold, and
+// dropped if its addressee acks it first, having heard it directly; an ack
+// is relayed only for a message that was. Must be called with a.mu held.
+func (a *igate) relayLocked(lsf *m17.LSF, t tnc2, now time.Time) {
+	m, ok := parseMessage(t)
+	if !ok || isGroupAddressee(m.addressee) || lsf.ECD() != nil || len(t.path) >= 8 ||
+		t.hasPathElement("TCPIP", "TCPXX", a.cfg.callsign) {
+		return
+	}
+	src, dst := strings.ToUpper(t.src), strings.ToUpper(m.addressee)
+	st := a.heard[dst]
+	if sameStation(src, dst) || sameStation(dst, a.cfg.callsign) || st == nil || now.Sub(st.last) > a.cfg.heardWindow {
+		return
+	}
+	p := &gatedPacket{class: gatedMessage, key: "relay " + t.key(), msg: m, from: src, queued: now,
+		notBefore: now.Add(a.cfg.relayHold)}
+	if m.ack {
+		if now.Sub(a.relayed[dst+">"+src+"{"+m.id]) > relayAckWindow {
+			return // they hear each other
+		}
+		p.class, p.notBefore = gatedAck, time.Time{}
+	} else if m.id != "" {
+		k := src + ">" + dst + "{" + m.id
+		p.key = "relay " + k
+		p.sent = func() {
+			a.mu.Lock()
+			a.relayed[k] = a.now()
+			a.mu.Unlock()
+		}
+	}
+	out := t
+	out.path = append(append([]string(nil), t.path...), a.cfg.callsign+"*")
+	p.line = out.String()
+	// Repeated as a duplex gateway repeats: the sender's LSF, marked with
+	// the gateway's callsign, on the addressee's CAN.
+	l := *lsf
+	l.Type[0] = l.Type[0]&^0x07 | st.lsfType[0]&0x07
+	l.Type[1] = l.Type[1]&^0x80 | st.lsfType[1]&0x80
+	l.SetECD(a.m17Enc, nil)
+	p.packet = m17.Packet{LSF: &l, Type: m17.PacketTypeAPRS, Payload: append([]byte(p.line), 0)}
+	p.packet.CalcCRC()
+	a.queue.push(p)
+	a.log.write(now, aprsEvent{Dir: aprsFromRF, M17: lsf.Src.Callsign(), Line: t.String(),
+		Result: "relay queued (" + p.class.String() + ")"})
+}
+
 // fromIS takes a packet from APRS-IS.
 func (a *igate) fromIS(line string) {
-	if a.queue == nil {
+	if !a.cfg.isToRF {
 		return
 	}
 	now := a.now()
@@ -452,6 +514,7 @@ func (a *igate) expire(now time.Time) {
 		maps.DeleteFunc(m, func(_ string, t time.Time) bool { return now.Sub(t) > onAirWindow })
 	}
 	maps.DeleteFunc(a.courtesySent, func(_ string, t time.Time) bool { return now.Sub(t) > courtesyInterval })
+	maps.DeleteFunc(a.relayed, func(_ string, t time.Time) bool { return now.Sub(t) > relayAckWindow })
 	for src, t := range a.positionTime {
 		if now.Sub(t) > a.cfg.heardWindow {
 			delete(a.positionTime, src)

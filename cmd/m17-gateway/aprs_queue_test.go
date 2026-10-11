@@ -111,3 +111,23 @@ func TestGatedQueueCancel(t *testing.T) {
 		t.Error("acked message still queued")
 	}
 }
+
+// TestGatedQueueHold: a held packet waits until its time without holding
+// up the ones behind it.
+func TestGatedQueueHold(t *testing.T) {
+	now := time.Now()
+	q := newGatedQueue(time.Hour, 60, 100, now)
+	held := gated(gatedMessage, "held", now)
+	held.notBefore = now.Add(5 * time.Second)
+	q.push(held)
+	q.push(gated(gatedMessage, "ready", now))
+	if p, _ := q.next(now); p == nil || p.key != "ready" {
+		t.Fatalf("next = %+v, want ready", p)
+	}
+	if p, wait := q.next(now); p != nil || wait != 5*time.Second {
+		t.Fatalf("next = %+v, %v; want nil, 5s", p, wait)
+	}
+	if p, _ := q.next(now.Add(5 * time.Second)); p != held {
+		t.Errorf("held packet not sent when due: %+v", p)
+	}
+}

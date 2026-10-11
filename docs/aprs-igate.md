@@ -9,6 +9,8 @@ A hotspot gates APRS carried in M17 packet mode between its RF and APRS-IS, the 
 - **RF → APRS-IS.** A `0x02` packet heard on RF is sent to APRS-IS with `,qAR,<gate>` appended. Packets are still forwarded to the reflector as before.
 - **APRS-IS → RF.** Messages for stations heard on this hotspot's RF, plus anything an optional extra filter selects, are transmitted as `0x02` packets. They go out broadcast, under the gateway's M17 callsign, through the existing packet queue.
 
+- **Relay (optional, simplex only).** Messages and acks between two stations both heard on RF are relayed when they evidently can't hear each other.
+
 Everything is off unless `[APRS] Enabled=true`. Transmitting from APRS-IS also needs `IStoRF=true`. With `Passcode=-1` the gate logs in receive-only and logs what it would have sent.
 
 ## Over-the-air format
@@ -88,9 +90,22 @@ Dire Wolf goes less far. It never compares APRS-IS packets with what it hears. I
 - **Local sender:** a message whose sender was heard on RF within 1 minute stays off RF, since the addressee can hear the sender.
 - **Extra-filter traffic** stays off RF when its source was heard on RF within `HeardWindow`.
 
-**A simplex limitation:** local-to-local messages are not relayed. If two radios on one simplex hotspot can't hear each other, their messages go to APRS-IS and stop there. APRS-IS doesn't return a packet to the client that sent it, and the local-sender rule would stop it anyway. On FM a digipeater covers this; here nothing does. Duplex hotspots already repeat. An RF-to-RF relay of messages between heard stations would be a separate feature.
+**Local stations on a simplex hotspot** that can't hear each other would otherwise never get each other's messages. Gating doesn't help: APRS-IS doesn't return a packet to the client that sent it, and the local-sender rule would stop it anyway. On FM a digipeater covers this, so the gate has a narrow relay for it (`Relay`, off by default; decision 7).
 
-### 7. Defaults, from measured airtime
+### 7. Relay between local stations
+
+**Chosen:** on a simplex hotspot, relay only APRS messages and acks, and only between two stations both heard directly on its RF.
+
+- **Messages:** a relay waits `RelayHold` (5 s) and is dropped if the addressee's ack is heard first, since the addressee then heard the sender directly. This is viscous digipeating, decided by the ack instead of by hearing another digipeater.
+- **Acks:** an ack is relayed only for a message the gate relayed in the last 5 minutes. If one station needed the relay, the other most likely does too.
+- **Marking:** the relay is the sender's LSF with the gateway in its Extended Callsign Data, as a duplex gateway repeats, on the addressee's CAN. The line gets `GATE*` added to its path. Other gateways therefore neither count it as a local station nor relay it again, and gates that hear it still gate it, as a digipeated packet.
+- **Excluded:** positions are not relayed. A duplex gateway relays nothing, since it repeats every packet already.
+
+**Alternatives:**
+- *A WIDEn-N digipeater:* radios would have to ask for it with a path, which OpenRTX doesn't send on M17. It would also double the airtime of every beacon on a voice channel.
+- *A KISS TNC for Dire Wolf or aprx to drive:* Dire Wolf third-party-wraps everything it sends from APRS-IS, which OpenRTX can't unwrap. The M17 parts (voice-first channel sharing, LSF, ECD, CAN) would still have to live in the gateway.
+
+### 8. Defaults, from measured airtime
 
 One `0x02` packet is preamble + LSF + ⌈(line + 4) / 25⌉ packet frames + EOT, at 40 ms each. Measured with `Packet.Encode()`:
 

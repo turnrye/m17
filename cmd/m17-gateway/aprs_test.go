@@ -381,3 +381,88 @@ func TestGatewayAPRS(t *testing.T) {
 		t.Errorf("transmitted %s", tx)
 	}
 }
+
+// relayIgate returns a gate that relays, having heard K0RET-7 (M17 K0RET)
+// and W5XYZ-7 (M17 W5XYZ, CAN 3) on RF.
+func relayIgate(t *testing.T, now *time.Time) *igate {
+	t.Helper()
+	a := testIgate(t, now)
+	a.cfg.relay, a.cfg.relayHold = true, 5*time.Second
+	hearRF(t, a, "K0RET", 0, "K0RET-7>APORT1:>here")
+	hearRF(t, a, "W5XYZ", 3, "W5XYZ-7>APORT1:>also here")
+	return a
+}
+
+// TestRelay: a message between two stations heard here is relayed after
+// the hold, marked with the gateway; the ack back is relayed too.
+func TestRelay(t *testing.T) {
+	now := time.Now()
+	a := relayIgate(t, &now)
+	hearRF(t, a, "K0RET", 0, "K0RET-7>APORT1::W5XYZ-7  :hi{01}")
+	if p, wait := a.queue.next(now); p != nil || wait != 5*time.Second {
+		t.Fatalf("relay not held: %v, %v", p, wait)
+	}
+	now = now.Add(5 * time.Second)
+	q := queuedRF(a, now)
+	if len(q) != 1 {
+		t.Fatalf("queued %v", q)
+	}
+	p := q[0]
+	lsf := p.packet.LSF
+	if p.class != gatedMessage || p.line != "K0RET-7>APORT1,K0RET-10*::W5XYZ-7  :hi{01}" {
+		t.Errorf("relayed %s %q", p.class, p.line)
+	}
+	if lsf.Src.Callsign() != "K0RET" || lsf.ECD() == nil || lsf.ECD().Callsign1.Callsign() != "K0RET   H" || !lsf.CheckCRC() {
+		t.Errorf("LSF %s", lsf)
+	}
+	if can := (lsf.Type[0]&0x07)<<1 | lsf.Type[1]>>7; can != 3 {
+		t.Errorf("CAN %d, want the addressee's 3", can)
+	}
+	p.sent()
+
+	hearRF(t, a, "W5XYZ", 3, "W5XYZ-7>APORT1::K0RET-7  :ack01")
+	q = queuedRF(a, now)
+	if len(q) != 1 || q[0].class != gatedAck || q[0].line != "W5XYZ-7>APORT1,K0RET-10*::K0RET-7  :ack01" {
+		t.Errorf("ack relay %v", q)
+	}
+}
+
+// TestRelayHeardDirectly: when the addressee acks within the hold, it
+// heard the sender directly: nothing is relayed either way.
+func TestRelayHeardDirectly(t *testing.T) {
+	now := time.Now()
+	a := relayIgate(t, &now)
+	hearRF(t, a, "K0RET", 0, "K0RET-7>APORT1::W5XYZ-7  :hi{01}")
+	now = now.Add(2 * time.Second)
+	hearRF(t, a, "W5XYZ", 3, "W5XYZ-7>APORT1::K0RET-7  :ack01")
+	now = now.Add(10 * time.Second)
+	if q := queuedRF(a, now); len(q) != 0 {
+		t.Errorf("relayed %v", q)
+	}
+}
+
+// TestRelayNot: positions, unheard or group addressees, and packets from
+// APRS-IS or another gateway are not relayed; nor anything when off.
+func TestRelayNot(t *testing.T) {
+	now := time.Now()
+	a := relayIgate(t, &now)
+	for _, l := range []string{
+		"K0RET-7>APORT1:!3508.37N/09001.05W[",
+		"K0RET-7>APORT1::N0BODY   :hi{01}",
+		"K0RET-7>APORT1::BLN1     :bulletin",
+		"W1AW>APK004,TCPIP,N0GW*::W5XYZ-7  :hi{02}",
+		"K0RET-7>APORT1,K0RET-10*::W5XYZ-7  :hi{03}",
+		"W5XYZ-7>APORT1::K0RET-7  :ack09",
+	} {
+		hearRF(t, a, "K0RET", 0, l)
+	}
+	lsf, _ := m17.NewLSF(m17.DestinationAll, "K0RET", m17.LSFTypePacket, m17.LSFDataTypeData, 0)
+	gw, _ := m17.EncodeCallsign("N0GW    C")
+	lsf.SetECD(gw, nil)
+	a.fromRF(&lsf, []byte("K0RET-7>APORT1::W5XYZ-7  :relayed{04}\x00"))
+	a.cfg.relay = false
+	hearRF(t, a, "K0RET", 0, "K0RET-7>APORT1::W5XYZ-7  :off{05}")
+	if q := queuedRF(a, now.Add(time.Minute)); len(q) != 0 {
+		t.Errorf("relayed %v", q)
+	}
+}

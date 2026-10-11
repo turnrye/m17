@@ -157,6 +157,7 @@ func (g *Gateway) sendGated(q *gatedQueue, minTxGap time.Duration, stop <-chan s
 		}
 		select {
 		case <-time.After(wait):
+		case <-q.wake: // something newly queued may be due sooner
 		case <-stop:
 			return
 		}
@@ -178,6 +179,9 @@ func (g *Gateway) transmitGated(p *gatedPacket, gap time.Duration) {
 		log.Printf("[INFO] APRS-IS to RF (%s, queued %v): %s", p.class, waited, p.line)
 		err := g.modem.TransmitPacket(p.packet)
 		g.packetSent()
+		if err == nil && p.sent != nil {
+			p.sent()
+		}
 		if g.aprs != nil {
 			result := "sent after " + waited.String()
 			if err != nil {

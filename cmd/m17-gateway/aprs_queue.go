@@ -28,15 +28,18 @@ func (c gatedClass) String() string {
 // dropped for a new one.
 var gatedClassLimit = [gatedClasses]int{16, 16, 8}
 
-// gatedPacket is an APRS-IS packet waiting to be transmitted.
+// gatedPacket is a packet from APRS-IS, or a relay, waiting to be
+// transmitted.
 type gatedPacket struct {
-	class  gatedClass
-	key    string // a queued packet with the same key is replaced
-	msg    aprsMessage
-	from   string
-	line   string
-	packet m17.Packet
-	queued time.Time
+	class     gatedClass
+	key       string // a queued packet with the same key is replaced
+	msg       aprsMessage
+	from      string
+	line      string
+	packet    m17.Packet
+	queued    time.Time
+	notBefore time.Time // held until then; zero to send when it can
+	sent      func()    // optional; called once it has been transmitted
 }
 
 // gatedQueue holds APRS-IS packets for RF by class, drops them when they
@@ -127,33 +130,49 @@ func (q *gatedQueue) len() int {
 }
 
 // next returns the packet to send at now and takes a token for it. With
-// none to send it returns how long until a token is due, or zero if the
-// queue is empty. Packets older than maxAge are dropped on the way.
+// none to send it returns how long until one is due, for a held packet or
+// a token, or zero if the queue is empty. Packets older than maxAge are
+// dropped on the way.
 func (q *gatedQueue) next(now time.Time) (*gatedPacket, time.Duration) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 	q.tokens = min(q.burst, q.tokens+now.Sub(q.lastFill).Seconds()*q.rate)
 	q.lastFill = now
 	var p *gatedPacket
+	var at int
+	var held time.Duration
 	for i := range q.classes {
-		c := q.classes[i]
-		for len(c) > 0 && now.Sub(c[0].queued) > q.maxAge {
-			log.Printf("[INFO] APRS: %s waited over %v, dropping %s", c[0].class, q.maxAge, c[0].line)
-			q.drop(c[0], "expired after "+q.maxAge.String())
-			c = c[1:]
+		c := q.classes[i][:0]
+		for _, e := range q.classes[i] {
+			if now.Sub(e.queued) > q.maxAge {
+				log.Printf("[INFO] APRS: %s waited over %v, dropping %s", e.class, q.maxAge, e.line)
+				q.drop(e, "expired after "+q.maxAge.String())
+				continue
+			}
+			c = append(c, e)
 		}
 		q.classes[i] = c
-		if p == nil && len(c) > 0 {
-			p = c[0]
+		for j, e := range c {
+			if p != nil {
+				break
+			}
+			if wait := e.notBefore.Sub(now); wait > 0 {
+				if held == 0 || wait < held {
+					held = wait
+				}
+				continue
+			}
+			p, at = e, j
 		}
 	}
 	if p == nil {
-		return nil, 0
+		return nil, held
 	}
 	if q.tokens < 1 {
 		return nil, time.Duration(math.Ceil((1 - q.tokens) / q.rate * float64(time.Second)))
 	}
 	q.tokens--
-	q.classes[p.class] = q.classes[p.class][1:]
+	c := q.classes[p.class]
+	q.classes[p.class] = append(c[:at:at], c[at+1:]...)
 	return p, 0
 }
