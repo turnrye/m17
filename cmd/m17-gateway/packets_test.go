@@ -57,7 +57,7 @@ func (m *recordingModem) times() []time.Time {
 func testGateway(t *testing.T, holdoff, gap time.Duration) (*Gateway, *recordingModem) {
 	t.Helper()
 	m := &recordingModem{}
-	g := &Gateway{modem: m, state: Idle, lastStreamID: 0xFFFF, rxHoldoff: holdoff, packetGap: gap, packetQueue: make(chan func() error, packetQueueLen)}
+	g := &Gateway{modem: m, state: Idle, rxHoldoff: holdoff, packetGap: gap, packetQueue: make(chan func() error, packetQueueLen)}
 	go g.sendPackets()
 	t.Cleanup(func() { close(g.packetQueue) })
 	return g, m
@@ -199,7 +199,7 @@ func (m *slowModem) TransmitPacket(p m17.Packet) error {
 func TestGatedHoldsVoice(t *testing.T) {
 	for _, hold := range []bool{true, false} {
 		m := &slowModem{}
-		g := &Gateway{modem: m, state: Idle, lastStreamID: 0xFFFF, rxHoldoff: time.Millisecond,
+		g := &Gateway{modem: m, state: Idle, rxHoldoff: time.Millisecond,
 			packetGap: time.Millisecond, packetQueue: make(chan func() error, packetQueueLen)}
 		g.link.Store(&inet.Client{})
 		g.aprs = &igate{cfg: aprsConfig{holdVoice: hold}, stats: newAPRSStats(), now: time.Now}

@@ -19,7 +19,7 @@ func linkGateway(t *testing.T, revertAfter time.Duration) (*Gateway, *fakeReflec
 	t.Helper()
 	a, b := newFakeReflector(t, true), newFakeReflector(t, true)
 	port := func(r *fakeReflector) uint { return uint(r.conn.LocalAddr().(*net.UDPAddr).Port) }
-	g := &Gateway{modem: &recordingModem{}, state: Idle, lastStreamID: 0xFFFF,
+	g := &Gateway{modem: &recordingModem{}, state: Idle,
 		callsign: "N1ADJ G", Name: "M17-AAA", Module: "A",
 		hostfile: &inet.Hostfile{Hosts: map[string]inet.Host{
 			"M17-AAA": {Name: "M17-AAA", Server: "127.0.0.1", Port: port(a)},
