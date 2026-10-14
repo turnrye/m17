@@ -373,9 +373,9 @@ type Gateway struct {
 	packetGap        time.Duration
 	packetQueue      chan func() error
 
-	lastFrameTimer *time.Timer
-	lastLSF        *m17.LSF // Workaround for reflectors that change the SRC during the stream
-	lastStreamID   uint16
+	netMu          sync.Mutex   // guards net, netTimer and netStreamHeld; one reflector frame to the modem at a time
+	net            *netStream   // the reflector voice stream under way; nil between streams
+	netTimer       *time.Timer  // fills gaps in that stream, and ends it if it stops
 	netStreamHeld  bool         // reflector voice is being held back
 	ownTX          atomic.Int32 // the gateway's own transmissions under way: announcements, echoes, APRS packets
 	rfToLegacy     bool         // the current RF stream is going to a legacy reflector
@@ -403,7 +403,6 @@ func NewGateway(cfg config, modem modem.Modem) (*Gateway, error) {
 		encodedCallsign:  *cs,
 		callsign:         cfg.callsign,
 		state:            Idle,
-		lastStreamID:     0xFFFF,
 		rxHoldoff:        cfg.rxHoldoff,
 		packetGap:        cfg.packetGap,
 		packetQueue:      make(chan func() error, packetQueueLen),
@@ -484,7 +483,6 @@ func (g *Gateway) transmitNetPacket(p m17.Packet) error {
 func (g *Gateway) TransmitVoiceStream(sd m17.StreamDatagram) error {
 	// Make a copy
 	lsf := *sd.LSF
-	// log.Printf("[DEBUG] Handle StreamDatagram id: %04x, lastStreamID: %04x, fn: %04x, last: %v", sd.StreamID, g.lastStreamID, sd.FrameNumber, sd.LastFrame)
 	// Shouldn't need the next line with modern reflectors
 	// sd.LSF.Dst = *callsignAll
 	// Replace META with Extended Callsign Data
@@ -495,13 +493,31 @@ func (g *Gateway) TransmitVoiceStream(sd m17.StreamDatagram) error {
 	sd.LSF.SetECD(&sd.LSF.Src, refl)
 	sd.LSF.Src = g.encodedCallsign
 	sd.LSF.CalcCRC()
+	now := time.Now()
+	g.netMu.Lock()
+	defer g.netMu.Unlock()
+	s := g.net
+	if s == nil || s.id != sd.StreamID {
+		if s != nil {
+			// Taken over by another stream before its last frame
+			g.endNetStream(s)
+		}
+		log.Printf("[DEBUG] Start Internet voice stream: %s", sd)
+		g.dashLog.LogFrame(&lsf, "Internet", "Voice Start")
+		// The first LSF is kept for the dashboard: some reflectors change
+		// the SRC during the stream.
+		s = &netStream{id: sd.StreamID, lsf: lsf}
+		g.net = s
+	}
+	s.received(sd, now)
+	s.txLSF = *sd.LSF
 	// Local RF takes precedence, and so does the gateway's own transmission.
 	// While a radio is transmitting to us, or the gateway is speaking or
 	// sending an APRS packet, hold the reflector stream back, then join it
 	// once the channel is clear: the modem starts a fresh transmission,
 	// preamble and LSF, with the next frame. Two transmissions at once would
 	// take the transmitter from each other frame by frame.
-	held := g.localRFActive() || g.ownTX.Load() > 0
+	held := g.netHeld()
 	if held != g.netStreamHeld {
 		if held {
 			log.Printf("[DEBUG] Holding Internet voice stream %04x for local RF or the gateway's own transmission", sd.StreamID)
@@ -511,46 +527,20 @@ func (g *Gateway) TransmitVoiceStream(sd m17.StreamDatagram) error {
 		g.netStreamHeld = held
 	}
 	var err error
-	if !held {
-		err = g.modem.TransmitVoiceStream(sd)
-		if err != nil {
-			log.Printf("[ERROR] Error transmitting voice stream: %v", err)
-			return err
-		}
-		g.voiceSent()
-	}
-	if g.lastFrameTimer != nil {
-		g.lastFrameTimer.Reset(time.Second)
-	}
-	// log.Printf("[DEBUG] received voice stream data from server: %#v", sd)
-	if g.lastStreamID != sd.StreamID {
-		if g.lastFrameTimer != nil {
-			g.lastFrameTimer.Stop()
-		}
-		log.Printf("[DEBUG] Start Internet voice stream: %s", sd)
-		g.dashLog.LogFrame(&lsf, "Internet", "Voice Start")
-		g.lastStreamID = sd.StreamID
-		g.lastLSF = &lsf
-		// Provide a backstop if we don't receive a last frame packet
-		g.lastFrameTimer = time.AfterFunc(time.Second, func() {
-			log.Printf("[DEBUG] Timed out Internet voice stream %04x", sd.StreamID)
-			g.dashLog.LogFrame(g.lastLSF, "Internet", "Voice End")
-			g.lastStreamID = 0xFFFF
-			g.lastFrameTimer = nil
-			g.lastLSF = nil
-			if g.getState() == Echo {
-				g.echoStreamEnd()
-			}
-		})
+	if held {
+		s.sending = false
+	} else if err = g.sendNetFrame(s, sd); err != nil {
+		log.Printf("[ERROR] Error transmitting voice stream: %v", err)
 	}
 	g.dashLog.LogGNSS(&lsf, "Internet")
 	if sd.LastFrame {
 		log.Printf("[DEBUG] End Internet voice stream: %s", sd)
-		g.dashLog.LogFrame(g.lastLSF, "Internet", "Voice End")
-		g.lastStreamID = 0xFFFF
-		g.lastLSF = nil
-		g.lastFrameTimer.Stop()
-		g.lastFrameTimer = nil
+		g.endNetStream(s)
+		if g.netTimer != nil {
+			g.netTimer.Stop()
+		}
+	} else {
+		g.armNetTimer(s)
 	}
 	return err
 }
@@ -801,6 +791,12 @@ func (g *Gateway) Close() {
 	if c := g.link.Swap(nil); c != nil {
 		c.Close()
 	}
+	g.netMu.Lock()
+	if g.netTimer != nil {
+		g.netTimer.Stop()
+	}
+	g.net = nil
+	g.netMu.Unlock()
 	if g.modem != nil {
 		g.modem.Close()
 	}

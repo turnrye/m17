@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"sync"
 	"testing"
 	"time"
@@ -10,12 +11,13 @@ import (
 )
 
 // recordingModem records when each packet is transmitted and its text, and
-// the frame number of each voice frame.
+// the frame number of each voice frame and whether it was silence.
 type recordingModem struct {
-	mu    sync.Mutex
-	sent  []time.Time
-	texts []string
-	voice []uint16
+	mu     sync.Mutex
+	sent   []time.Time
+	texts  []string
+	voice  []uint16
+	silent []bool // each voice frame was silence
 }
 
 func (m *recordingModem) StartDecoding(func(uint16, []m17.SoftBit)) {}
@@ -26,7 +28,14 @@ func (m *recordingModem) TransmitVoiceStream(sd m17.StreamDatagram) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.voice = append(m.voice, sd.FrameNumber)
+	m.silent = append(m.silent, bytes.Equal(sd.Payload[:], codec2silence3200))
 	return nil
+}
+
+func (m *recordingModem) silentFrames() []bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return append([]bool(nil), m.silent...)
 }
 func (m *recordingModem) TransmitPacket(p m17.Packet) error {
 	m.mu.Lock()
@@ -57,7 +66,7 @@ func (m *recordingModem) times() []time.Time {
 func testGateway(t *testing.T, holdoff, gap time.Duration) (*Gateway, *recordingModem) {
 	t.Helper()
 	m := &recordingModem{}
-	g := &Gateway{modem: m, state: Idle, lastStreamID: 0xFFFF, rxHoldoff: holdoff, packetGap: gap, packetQueue: make(chan func() error, packetQueueLen)}
+	g := &Gateway{modem: m, state: Idle, rxHoldoff: holdoff, packetGap: gap, packetQueue: make(chan func() error, packetQueueLen)}
 	go g.sendPackets()
 	t.Cleanup(func() { close(g.packetQueue) })
 	return g, m
@@ -199,7 +208,7 @@ func (m *slowModem) TransmitPacket(p m17.Packet) error {
 func TestGatedHoldsVoice(t *testing.T) {
 	for _, hold := range []bool{true, false} {
 		m := &slowModem{}
-		g := &Gateway{modem: m, state: Idle, lastStreamID: 0xFFFF, rxHoldoff: time.Millisecond,
+		g := &Gateway{modem: m, state: Idle, rxHoldoff: time.Millisecond,
 			packetGap: time.Millisecond, packetQueue: make(chan func() error, packetQueueLen)}
 		g.link.Store(&inet.Client{})
 		g.aprs = &igate{cfg: aprsConfig{holdVoice: hold}, stats: newAPRSStats(), now: time.Now}
