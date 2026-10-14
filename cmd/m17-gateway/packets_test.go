@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"sync"
 	"testing"
 	"time"
@@ -10,12 +11,13 @@ import (
 )
 
 // recordingModem records when each packet is transmitted and its text, and
-// the frame number of each voice frame.
+// the frame number of each voice frame and whether it was silence.
 type recordingModem struct {
-	mu    sync.Mutex
-	sent  []time.Time
-	texts []string
-	voice []uint16
+	mu     sync.Mutex
+	sent   []time.Time
+	texts  []string
+	voice  []uint16
+	silent []bool // each voice frame was silence
 }
 
 func (m *recordingModem) StartDecoding(func(uint16, []m17.SoftBit)) {}
@@ -26,7 +28,14 @@ func (m *recordingModem) TransmitVoiceStream(sd m17.StreamDatagram) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.voice = append(m.voice, sd.FrameNumber)
+	m.silent = append(m.silent, bytes.Equal(sd.Payload[:], codec2silence3200))
 	return nil
+}
+
+func (m *recordingModem) silentFrames() []bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return append([]bool(nil), m.silent...)
 }
 func (m *recordingModem) TransmitPacket(p m17.Packet) error {
 	m.mu.Lock()

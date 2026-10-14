@@ -375,7 +375,7 @@ type Gateway struct {
 
 	netMu          sync.Mutex   // guards net, netTimer and netStreamHeld; one reflector frame to the modem at a time
 	net            *netStream   // the reflector voice stream under way; nil between streams
-	netTimer       *time.Timer  // ends that stream if it stops
+	netTimer       *time.Timer  // fills gaps in that stream, and ends it if it stops
 	netStreamHeld  bool         // reflector voice is being held back
 	ownTX          atomic.Int32 // the gateway's own transmissions under way: announcements, echoes, APRS packets
 	rfToLegacy     bool         // the current RF stream is going to a legacy reflector
@@ -510,6 +510,7 @@ func (g *Gateway) TransmitVoiceStream(sd m17.StreamDatagram) error {
 		g.net = s
 	}
 	s.received(sd, now)
+	s.txLSF = *sd.LSF
 	// Local RF takes precedence, and so does the gateway's own transmission.
 	// While a radio is transmitting to us, or the gateway is speaking or
 	// sending an APRS packet, hold the reflector stream back, then join it
@@ -526,12 +527,10 @@ func (g *Gateway) TransmitVoiceStream(sd m17.StreamDatagram) error {
 		g.netStreamHeld = held
 	}
 	var err error
-	if !held {
-		if err = g.modem.TransmitVoiceStream(sd); err != nil {
-			log.Printf("[ERROR] Error transmitting voice stream: %v", err)
-		} else {
-			g.voiceSent()
-		}
+	if held {
+		s.sending = false
+	} else if err = g.sendNetFrame(s, sd); err != nil {
+		log.Printf("[ERROR] Error transmitting voice stream: %v", err)
 	}
 	g.dashLog.LogGNSS(&lsf, "Internet")
 	if sd.LastFrame {
